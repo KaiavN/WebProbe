@@ -72,6 +72,7 @@ pub enum IssueCategory {
     Accessibility,
     Performance,
     Security,
+    Seo,
     LoadTest,
     UnhandledRejection,
 }
@@ -86,6 +87,7 @@ impl fmt::Display for IssueCategory {
             IssueCategory::Accessibility => write!(f, "Accessibility"),
             IssueCategory::Performance => write!(f, "Performance"),
             IssueCategory::Security => write!(f, "Security"),
+            IssueCategory::Seo => write!(f, "SEO"),
             IssueCategory::LoadTest => write!(f, "Load Test"),
             IssueCategory::UnhandledRejection => write!(f, "Unhandled Rejection"),
         }
@@ -213,6 +215,7 @@ pub struct LoadTestResult {
     pub throughput_rps: f64,
     pub latency_p50_ms: f64,
     pub latency_p90_ms: f64,
+    pub latency_p95_ms: f64,
     pub latency_p99_ms: f64,
     pub latency_min_ms: f64,
     pub latency_max_ms: f64,

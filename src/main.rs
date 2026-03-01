@@ -41,6 +41,10 @@ enum Commands {
         #[arg(long, default_value_t = 30)]
         duration: u64,
 
+        /// Number of concurrent browser tabs for crawling
+        #[arg(short = 'c', long, default_value_t = 1)]
+        concurrency: usize,
+
         /// Run browser in headed (visible) mode
         #[arg(long)]
         headed: bool,
@@ -134,6 +138,7 @@ async fn main() -> Result<()> {
             output,
             users,
             duration,
+            concurrency,
             headed,
             wait_ms,
             no_load,
@@ -167,7 +172,7 @@ async fn main() -> Result<()> {
             let crawler_config = crawler::CrawlerConfig {
                 start_url: url.clone(),
                 max_depth: depth,
-                concurrency: 1,
+                concurrency,
                 headless: !headed,
                 settle_ms: wait_ms,
                 auth,
@@ -182,15 +187,26 @@ async fn main() -> Result<()> {
             report.crawl_stats = crawl_result.stats;
 
             if !no_load && users > 0 {
+                let load_urls = if crawl_result.discovered_urls.is_empty() {
+                    vec![url.clone()]
+                } else {
+                    crawl_result.discovered_urls.clone()
+                };
+                let url_msg = if load_urls.len() > 1 {
+                    format!("{} URLs, ", load_urls.len())
+                } else {
+                    String::new()
+                };
                 println!(
-                    "\n  {} Running load test ({} user{}, {}s)…\n",
+                    "\n  {} Running load test ({}{}s, {} user{})…\n",
                     style("→").cyan(),
+                    url_msg,
+                    duration,
                     users,
                     if users == 1 { "" } else { "s" },
-                    duration
                 );
                 let load_result = load::run_load_test(load::LoadConfig {
-                    url: url.clone(),
+                    urls: load_urls,
                     users,
                     duration_secs: duration,
                 })
@@ -228,7 +244,7 @@ async fn main() -> Result<()> {
             );
 
             let load_result = load::run_load_test(load::LoadConfig {
-                url: url.clone(),
+                urls: vec![url.clone()],
                 users,
                 duration_secs: duration,
             })

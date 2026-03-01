@@ -132,8 +132,8 @@ pub fn print_report(report: &Report) {
             lt.error_rate_pct
         );
         println!(
-            "  Latency  p50:{:.0}ms  p90:{:.0}ms  p99:{:.0}ms  max:{:.0}ms",
-            lt.latency_p50_ms, lt.latency_p90_ms, lt.latency_p99_ms, lt.latency_max_ms
+            "  Latency  p50:{:.0}ms  p90:{:.0}ms  p95:{:.0}ms  p99:{:.0}ms  max:{:.0}ms",
+            lt.latency_p50_ms, lt.latency_p90_ms, lt.latency_p95_ms, lt.latency_p99_ms, lt.latency_max_ms
         );
     }
 

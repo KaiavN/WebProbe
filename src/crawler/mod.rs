@@ -5,12 +5,14 @@ pub mod state;
 
 use crate::types::{AuthConfig, CookieEntry, CrawlStats, Issue, IssueCategory, NetworkStats, PageState, PerfMetrics, Severity};
 use anyhow::{Context, Result};
+use async_channel;
 use browser::HeadlessBrowser;
 use collectors::JsCollector;
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use state::StateTracker;
-use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use url::Url;
 
@@ -20,8 +22,7 @@ const PAGE_TIMEOUT: Duration = Duration::from_secs(20);
 pub struct CrawlerConfig {
     pub start_url: String,
     pub max_depth: usize,
-    /// Unused — single sequential tab. Kept for CLI compat.
-    #[allow(dead_code)]
+    /// Number of concurrent browser tabs to use for crawling.
     pub concurrency: usize,
     pub headless: bool,
     pub settle_ms: u64,
@@ -33,10 +34,13 @@ pub struct CrawlResult {
     pub perf_metrics: Vec<PerfMetrics>,
     pub network_stats: Vec<NetworkStats>,
     pub stats: CrawlStats,
+    /// All successfully crawled page URLs (for multi-URL load testing).
+    pub discovered_urls: Vec<String>,
 }
 
 pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
     let start = Instant::now();
+    let concurrency = config.concurrency.max(1);
     let base_url = Url::parse(&config.start_url)?;
     let base_host = base_url.host_str().unwrap_or("").to_string();
 
@@ -68,19 +72,23 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
         style("ready").green().bold(),
         launch_start.elapsed().as_secs_f64()
     );
-
     tokio::spawn(driver);
-    let page = browser.new_page().await?;
 
-    // Inject error collector so it fires before any page script on every goto
-    JsCollector::inject_on_new_document(&page).await?;
+    // ── Open `concurrency` tabs ──────────────────────────────────────────────
+    if concurrency > 1 {
+        println!("  {} Opening {} tabs…", style("→").cyan(), concurrency);
+    }
+    let mut pages = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let p = browser.new_page().await?;
+        JsCollector::inject_on_new_document(&p).await?;
+        block_heavy_resources(&p).await;
+        pages.push(p);
+    }
 
-    // Block heavy resources — we don't need images/fonts/video for auditing
-    block_heavy_resources(&page).await;
-
-    // ── Auth: inject cookies and/or perform login ────────────────────────────
+    // ── Auth: inject cookies and/or perform login (first tab only) ───────────
     if config.auth.cookies_file.is_some() {
-        if let Err(e) = inject_cookies(&page, &config.auth).await {
+        if let Err(e) = inject_cookies(&pages[0], &config.auth).await {
             eprintln!("  {} Cookie injection failed: {}", style("⚠").yellow(), e);
         } else {
             println!("  {} Cookies injected", style("✓").green());
@@ -89,20 +97,32 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
 
     if config.auth.login_url.is_some() && config.auth.username.is_some() {
         print!("  {} Authenticating… ", style("→").cyan());
-        match perform_login(&page, &config.auth, &config.start_url, config.settle_ms).await {
+        match perform_login(&pages[0], &config.auth, &config.start_url, config.settle_ms).await {
             Ok(()) => println!("{}", style("ok").green().bold()),
             Err(e) => println!("{} ({})", style("failed").red().bold(), e),
         }
     }
 
-    // ── BFS: discover + audit in one browser pass ────────────────────────────
-    // This handles SPAs correctly: a Vite app returns index.html for every
-    // route, so link discovery MUST happen via rendered DOM (not HTTP body).
+    // ── BFS with pending-counter completion detection ────────────────────────
+    //
+    // `pending` counts items in flight (in queue + actively being processed).
+    // Starting at 1 for the seed URL.  Each new link discovered increments
+    // pending before being sent to the channel; each completed state decrements
+    // pending.  When pending hits 0 the channel is closed and all workers exit.
     let tracker = StateTracker::new();
-    let mut queue: VecDeque<PageState> = VecDeque::new();
+    let (tx, rx) = async_channel::bounded::<PageState>(2000);
     let first = PageState::new(&config.start_url);
     tracker.visit(&first.fingerprint());
-    queue.push_back(first);
+    tx.send(first).await.ok();
+    let pending = Arc::new(AtomicUsize::new(1));
+
+    // Shared result accumulators
+    let all_issues: Arc<Mutex<Vec<Issue>>> = Arc::new(Mutex::new(Vec::new()));
+    let all_perf: Arc<Mutex<Vec<PerfMetrics>>> = Arc::new(Mutex::new(Vec::new()));
+    let all_network: Arc<Mutex<Vec<NetworkStats>>> = Arc::new(Mutex::new(Vec::new()));
+    let all_discovered: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let pages_visited = Arc::new(AtomicUsize::new(0));
+    let issue_count = Arc::new(AtomicUsize::new(0));
 
     let pb = ProgressBar::new_spinner();
     pb.set_style(
@@ -114,64 +134,110 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
     pb.enable_steady_tick(Duration::from_millis(80));
     pb.set_message(config.start_url.clone());
 
-    let mut all_issues: Vec<Issue> = Vec::new();
-    let mut all_perf: Vec<PerfMetrics> = Vec::new();
-    let mut all_network: Vec<NetworkStats> = Vec::new();
-    let mut pages_visited: usize = 0;
+    // ── Spawn one worker task per tab ────────────────────────────────────────
+    let mut handles = vec![];
+    for page in pages {
+        let rx = rx.clone();
+        let tx = tx.clone();
+        let pending = Arc::clone(&pending);
+        let tracker = tracker.clone();
+        let all_issues = Arc::clone(&all_issues);
+        let all_perf = Arc::clone(&all_perf);
+        let all_network = Arc::clone(&all_network);
+        let all_discovered = Arc::clone(&all_discovered);
+        let pages_visited = Arc::clone(&pages_visited);
+        let issue_count = Arc::clone(&issue_count);
+        let base_host = base_host.clone();
+        let settle_ms = config.settle_ms;
+        let max_depth = config.max_depth;
+        let pb = pb.clone();
 
-    while let Some(state) = queue.pop_front() {
-        pb.set_message(state.url.clone());
+        handles.push(tokio::spawn(async move {
+            while let Ok(state) = rx.recv().await {
+                pb.set_message(state.url.clone());
 
-        let result = tokio::time::timeout(
-            PAGE_TIMEOUT,
-            audit_and_discover(
-                &page,
-                &state.url,
-                &base_host,
-                config.settle_ms,
-                state.depth < config.max_depth,
-            ),
-        )
-        .await;
+                let result = tokio::time::timeout(
+                    PAGE_TIMEOUT,
+                    audit_and_discover(
+                        &page,
+                        &state.url,
+                        &base_host,
+                        settle_ms,
+                        state.depth < max_depth,
+                    ),
+                )
+                .await;
 
-        match result {
-            Ok(Ok((issues, perf, net, links))) => {
-                let issue_count = issues.len();
-                all_issues.extend(issues);
-                all_perf.push(perf);
-                all_network.push(net);
-                pages_visited += 1;
-                pb.set_position(pages_visited as u64);
-                pb.set_length(pb.length().unwrap_or(0) + issue_count as u64);
+                match result {
+                    Ok(Ok((issues, perf, net, links))) => {
+                        let n_issues = issues.len();
 
-                for link in links {
-                    let child = state.child(&link, "link");
-                    let fp = child.fingerprint();
-                    if tracker.visit(&fp) {
-                        queue.push_back(child);
+                        // Increment pending for each new child BEFORE sending to
+                        // the channel, so the counter never hits 0 prematurely.
+                        let mut new_states = vec![];
+                        for link in links {
+                            let child = state.child(&link, "link");
+                            let fp = child.fingerprint();
+                            if tracker.visit(&fp) {
+                                pending.fetch_add(1, Ordering::SeqCst);
+                                new_states.push(child);
+                            }
+                        }
+
+                        {
+                            let mut g = all_issues.lock().unwrap();
+                            g.extend(issues);
+                        }
+                        all_perf.lock().unwrap().push(perf);
+                        all_network.lock().unwrap().push(net);
+                        all_discovered.lock().unwrap().push(state.url.clone());
+
+                        let visited = pages_visited.fetch_add(1, Ordering::Relaxed) + 1;
+                        issue_count.fetch_add(n_issues, Ordering::Relaxed);
+                        pb.set_position(visited as u64);
+                        pb.set_length(issue_count.load(Ordering::Relaxed) as u64);
+
+                        for child in new_states {
+                            tx.send(child).await.ok();
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        pb.println(format!(
+                            "  {} {} — {}",
+                            style("⚠").yellow(),
+                            state.url,
+                            e
+                        ));
+                    }
+                    Err(_) => {
+                        pb.println(format!(
+                            "  {} {} — timed out (>{}s), skipped",
+                            style("⚠").yellow(),
+                            state.url,
+                            PAGE_TIMEOUT.as_secs()
+                        ));
                     }
                 }
+
+                // Decrement pending; close channel when all work is exhausted.
+                if pending.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    tx.close();
+                }
             }
-            Ok(Err(e)) => {
-                pb.println(format!(
-                    "  {} {} — {}",
-                    style("⚠").yellow(),
-                    state.url,
-                    e
-                ));
-            }
-            Err(_) => {
-                pb.println(format!(
-                    "  {} {} — timed out (>{}s), skipped",
-                    style("⚠").yellow(),
-                    state.url,
-                    PAGE_TIMEOUT.as_secs()
-                ));
-            }
-        }
+        }));
     }
 
+    for h in handles {
+        h.await.ok();
+    }
     pb.finish_and_clear();
+
+    let pages_visited = pages_visited.load(Ordering::Relaxed);
+    let all_issues = Arc::try_unwrap(all_issues).unwrap().into_inner().unwrap();
+    let all_perf = Arc::try_unwrap(all_perf).unwrap().into_inner().unwrap();
+    let all_network = Arc::try_unwrap(all_network).unwrap().into_inner().unwrap();
+    let all_discovered = Arc::try_unwrap(all_discovered).unwrap().into_inner().unwrap();
+
     println!(
         "  {} Crawled {} page{}  ({} issue{})",
         style("✓").green().bold(),
@@ -180,8 +246,6 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
         all_issues.len(),
         if all_issues.len() == 1 { "" } else { "s" }
     );
-
-    page.close().await.ok();
 
     Ok(CrawlResult {
         issues: all_issues,
@@ -193,6 +257,7 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
             states_explored: pages_visited,
             duration_secs: start.elapsed().as_secs_f64(),
         },
+        discovered_urls: all_discovered,
     })
 }
 
@@ -271,6 +336,40 @@ async fn audit_and_discover(
                     el: el.outerHTML.slice(0, 120) }});
             }}
         }});
+
+        // Accessibility: links with no text or aria-label
+        document.querySelectorAll('a:not([aria-label]):not([aria-labelledby])').forEach(el => {{
+            if (!el.textContent.trim() && !el.querySelector('img[alt]')) {{
+                issues.push({{ sev: 'warning', cat: 'accessibility',
+                    msg: 'Link has no accessible text',
+                    el: el.outerHTML.slice(0, 120) }});
+            }}
+        }});
+
+        // SEO: missing or empty <title>
+        const title = document.querySelector('title');
+        if (!title || !title.textContent.trim()) {{
+            issues.push({{ sev: 'warning', cat: 'seo',
+                msg: 'Page is missing a <title> element' }});
+        }}
+
+        // SEO/Accessibility: <html> missing lang attribute
+        if (!document.documentElement.getAttribute('lang')) {{
+            issues.push({{ sev: 'warning', cat: 'accessibility',
+                msg: '<html> element is missing a lang attribute' }});
+        }}
+
+        // SEO: missing viewport meta (important for mobile)
+        if (!document.querySelector('meta[name="viewport"]')) {{
+            issues.push({{ sev: 'info', cat: 'seo',
+                msg: 'Missing <meta name="viewport"> — page may render poorly on mobile' }});
+        }}
+
+        // SEO: missing meta description
+        if (!document.querySelector('meta[name="description"]')) {{
+            issues.push({{ sev: 'info', cat: 'seo',
+                msg: 'Missing <meta name="description">' }});
+        }}
 
         // Link discovery (SPA-aware — uses rendered DOM hrefs)
         const links = [];
@@ -370,6 +469,7 @@ async fn audit_and_discover(
             };
             let category = match item["cat"].as_str().unwrap_or("") {
                 "accessibility" => IssueCategory::Accessibility,
+                "seo" => IssueCategory::Seo,
                 _ => IssueCategory::ConsoleError,
             };
             page_issues.push(Issue {

@@ -8,16 +8,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub struct LoadConfig {
-    pub url: String,
+    /// One or more URLs to target; workers round-robin across them.
+    pub urls: Vec<String>,
     pub users: u32,
     pub duration_secs: u64,
 }
 
 pub async fn run_load_test(config: LoadConfig) -> Result<LoadTestResult> {
+    assert!(!config.urls.is_empty(), "LoadConfig.urls must not be empty");
+
+    let urls = Arc::new(config.urls.clone());
+
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(config.users as usize + 1)
-        // Keep connections alive across requests for accurate throughput
         .connection_verbose(false)
         .build()?;
     let client = Arc::new(client);
@@ -37,39 +41,42 @@ pub async fn run_load_test(config: LoadConfig) -> Result<LoadTestResult> {
 
     let deadline = Instant::now() + Duration::from_secs(config.duration_secs);
 
-    // Spawn N concurrent user tasks; each owns a local histogram to avoid contention
+    // Spawn N concurrent user tasks; each owns a local histogram to avoid contention.
+    // Workers cycle through `urls` round-robin so all pages are exercised under load.
     let mut handles = vec![];
-    for _ in 0..config.users {
+    for worker_id in 0..config.users {
         let client = Arc::clone(&client);
         let total = Arc::clone(&total_requests);
         let failed = Arc::clone(&failed_requests);
-        let url = config.url.clone();
+        let urls = Arc::clone(&urls);
+        // Stagger starting offset so workers don't all hit the same URL at once
+        let start_offset = worker_id as usize;
 
         handles.push(tokio::spawn(async move {
             let mut local_hist: Histogram<u64> = Histogram::new(3).unwrap();
+            let mut req_count: usize = start_offset;
             while Instant::now() < deadline {
-                let t = Instant::now();
-                let result = client.get(&url).send().await;
+                let url = &urls[req_count % urls.len()];
+                req_count += 1;
 
+                let t = Instant::now();
+                let result = client.get(url).send().await;
+
+                let elapsed_us = t.elapsed().as_micros() as u64;
+                total.fetch_add(1, Ordering::Relaxed);
                 match result {
                     Ok(resp) => {
                         let ok = resp.status().is_success();
-                        // Drain body so the connection is returned to the pool
-                        resp.bytes().await.ok();
-                        let elapsed_us = t.elapsed().as_micros() as u64;
-                        total.fetch_add(1, Ordering::Relaxed);
+                        resp.bytes().await.ok(); // drain so connection returns to pool
                         if !ok {
                             failed.fetch_add(1, Ordering::Relaxed);
                         }
-                        local_hist.record(elapsed_us).ok();
                     }
                     Err(_) => {
-                        let elapsed_us = t.elapsed().as_micros() as u64;
-                        total.fetch_add(1, Ordering::Relaxed);
                         failed.fetch_add(1, Ordering::Relaxed);
-                        local_hist.record(elapsed_us).ok();
                     }
                 }
+                local_hist.record(elapsed_us.max(1)).ok();
             }
             local_hist
         }));
@@ -80,6 +87,7 @@ pub async fn run_load_test(config: LoadConfig) -> Result<LoadTestResult> {
     let total_clone = Arc::clone(&total_requests);
     let failed_clone = Arc::clone(&failed_requests);
     let dur = config.duration_secs;
+    let n_urls = config.urls.len();
     tokio::spawn(async move {
         let start = Instant::now();
         let mut last_total = 0u64;
@@ -99,8 +107,13 @@ pub async fn run_load_test(config: LoadConfig) -> Result<LoadTestResult> {
                 0.0
             };
             pb_clone.set_position(elapsed.min(dur));
+            let url_info = if n_urls > 1 {
+                format!("  urls:{n_urls}")
+            } else {
+                String::new()
+            };
             pb_clone.set_message(format!(
-                "RPS: {rps}  total: {cur_total}  errors: {err_pct:.1}%"
+                "RPS: {rps}  total: {cur_total}  errors: {err_pct:.1}%{url_info}"
             ));
         }
     });
@@ -123,10 +136,11 @@ pub async fn run_load_test(config: LoadConfig) -> Result<LoadTestResult> {
     let max = merged.max() as f64 / 1000.0;
     let p50 = merged.value_at_percentile(50.0) as f64 / 1000.0;
     let p90 = merged.value_at_percentile(90.0) as f64 / 1000.0;
+    let p95 = merged.value_at_percentile(95.0) as f64 / 1000.0;
     let p99 = merged.value_at_percentile(99.0) as f64 / 1000.0;
 
     Ok(LoadTestResult {
-        url: config.url,
+        url: config.urls[0].clone(),
         users: config.users,
         duration_secs: config.duration_secs,
         total_requests: total,
@@ -140,6 +154,7 @@ pub async fn run_load_test(config: LoadConfig) -> Result<LoadTestResult> {
         throughput_rps: total as f64 / config.duration_secs as f64,
         latency_p50_ms: p50,
         latency_p90_ms: p90,
+        latency_p95_ms: p95,
         latency_p99_ms: p99,
         latency_min_ms: min,
         latency_max_ms: max,
