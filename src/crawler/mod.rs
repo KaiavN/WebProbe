@@ -394,8 +394,11 @@ async fn audit_and_discover(
         const nav = performance.getEntriesByType('navigation')[0] || {{}};
         const paint = {{}};
         performance.getEntriesByType('paint').forEach(e => {{ paint[e.name] = e.startTime; }});
-        const lcpEntries = performance.getEntriesByType('largest-contentful-paint');
-        const lcp = lcpEntries.length ? lcpEntries[lcpEntries.length - 1].startTime : null;
+        // LCP/CLS/TBT collected by the injected PerformanceObserver in COLLECTOR_JS
+        const lcp = window.__wp_lcp || null;
+        const cls = (typeof window.__wp_cls === 'number' && window.__wp_cls > 0) ? window.__wp_cls : null;
+        const tbt = (typeof window.__wp_tbt === 'number' && window.__wp_tbt > 0) ? window.__wp_tbt : null;
+        const tti = nav.domInteractive > 0 ? nav.domInteractive : null;
 
         // Network statistics from Navigation Timing API
         const dns = (nav.domainLookupEnd != null && nav.domainLookupStart != null)
@@ -427,6 +430,9 @@ async fn audit_and_discover(
             perf: {{
                 fcp: paint['first-contentful-paint'] || null,
                 lcp: lcp,
+                cls: cls,
+                tbt: tbt,
+                tti: tti,
                 dcl: nav.domContentLoadedEventEnd || null,
                 load: nav.loadEventEnd || null
             }},
@@ -513,9 +519,11 @@ async fn audit_and_discover(
         page_url: url.to_string(),
         fcp_ms: p["fcp"].as_f64(),
         lcp_ms: p["lcp"].as_f64(),
+        tti_ms: p["tti"].as_f64(),
+        cls_score: p["cls"].as_f64(),
+        tbt_ms: p["tbt"].as_f64(),
         dom_content_loaded_ms: p["dcl"].as_f64(),
         load_ms: load,
-        ..Default::default()
     };
 
     let n = &v["net"];
