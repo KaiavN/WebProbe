@@ -1,0 +1,608 @@
+pub mod browser;
+pub mod collectors;
+pub mod element;
+pub mod state;
+
+use crate::types::{AuthConfig, CookieEntry, CrawlStats, Issue, IssueCategory, NetworkStats, PageState, PerfMetrics, Severity};
+use anyhow::{Context, Result};
+use browser::HeadlessBrowser;
+use collectors::JsCollector;
+use console::style;
+use indicatif::{ProgressBar, ProgressStyle};
+use state::StateTracker;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+use url::Url;
+
+/// Timeout for a single page audit (goto + dom ready + JS eval).
+const PAGE_TIMEOUT: Duration = Duration::from_secs(20);
+
+pub struct CrawlerConfig {
+    pub start_url: String,
+    pub max_depth: usize,
+    /// Unused — single sequential tab. Kept for CLI compat.
+    #[allow(dead_code)]
+    pub concurrency: usize,
+    pub headless: bool,
+    pub settle_ms: u64,
+    pub auth: AuthConfig,
+}
+
+pub struct CrawlResult {
+    pub issues: Vec<Issue>,
+    pub perf_metrics: Vec<PerfMetrics>,
+    pub network_stats: Vec<NetworkStats>,
+    pub stats: CrawlStats,
+}
+
+pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
+    let start = Instant::now();
+    let base_url = Url::parse(&config.start_url)?;
+    let base_host = base_url.host_str().unwrap_or("").to_string();
+
+    // ── HTTP pre-check (fast-fail before Chrome launch) ─────────────────────
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    print!("  {} Checking {}… ", style("→").cyan(), &config.start_url);
+    match http_client.get(&config.start_url).send().await {
+        Ok(_) => println!("{}", style("ok").green().bold()),
+        Err(_) => {
+            println!("{}", style("unreachable").red().bold());
+            anyhow::bail!(
+                "Cannot reach {} — is your server running?",
+                config.start_url
+            );
+        }
+    }
+
+    // ── Launch browser ───────────────────────────────────────────────────────
+    print!("  {} Launching browser… ", style("→").cyan());
+    let launch_start = Instant::now();
+    let (browser, driver) = HeadlessBrowser::launch(config.headless)
+        .await
+        .context("Failed to launch Chrome — is Google Chrome installed in /Applications?")?;
+    println!(
+        "{}  ({:.1}s)",
+        style("ready").green().bold(),
+        launch_start.elapsed().as_secs_f64()
+    );
+
+    tokio::spawn(driver);
+    let page = browser.new_page().await?;
+
+    // Inject error collector so it fires before any page script on every goto
+    JsCollector::inject_on_new_document(&page).await?;
+
+    // Block heavy resources — we don't need images/fonts/video for auditing
+    block_heavy_resources(&page).await;
+
+    // ── Auth: inject cookies and/or perform login ────────────────────────────
+    if config.auth.cookies_file.is_some() {
+        if let Err(e) = inject_cookies(&page, &config.auth).await {
+            eprintln!("  {} Cookie injection failed: {}", style("⚠").yellow(), e);
+        } else {
+            println!("  {} Cookies injected", style("✓").green());
+        }
+    }
+
+    if config.auth.login_url.is_some() && config.auth.username.is_some() {
+        print!("  {} Authenticating… ", style("→").cyan());
+        match perform_login(&page, &config.auth, &config.start_url, config.settle_ms).await {
+            Ok(()) => println!("{}", style("ok").green().bold()),
+            Err(e) => println!("{} ({})", style("failed").red().bold(), e),
+        }
+    }
+
+    // ── BFS: discover + audit in one browser pass ────────────────────────────
+    // This handles SPAs correctly: a Vite app returns index.html for every
+    // route, so link discovery MUST happen via rendered DOM (not HTTP body).
+    let tracker = StateTracker::new();
+    let mut queue: VecDeque<PageState> = VecDeque::new();
+    let first = PageState::new(&config.start_url);
+    tracker.visit(&first.fingerprint());
+    queue.push_back(first);
+
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template(
+            " {spinner:.cyan} Crawling {wide_msg}  [{elapsed_precise}]  pages:{pos}  issues:{len}",
+        )
+        .unwrap(),
+    );
+    pb.enable_steady_tick(Duration::from_millis(80));
+    pb.set_message(config.start_url.clone());
+
+    let mut all_issues: Vec<Issue> = Vec::new();
+    let mut all_perf: Vec<PerfMetrics> = Vec::new();
+    let mut all_network: Vec<NetworkStats> = Vec::new();
+    let mut pages_visited: usize = 0;
+
+    while let Some(state) = queue.pop_front() {
+        pb.set_message(state.url.clone());
+
+        let result = tokio::time::timeout(
+            PAGE_TIMEOUT,
+            audit_and_discover(
+                &page,
+                &state.url,
+                &base_host,
+                config.settle_ms,
+                state.depth < config.max_depth,
+            ),
+        )
+        .await;
+
+        match result {
+            Ok(Ok((issues, perf, net, links))) => {
+                let issue_count = issues.len();
+                all_issues.extend(issues);
+                all_perf.push(perf);
+                all_network.push(net);
+                pages_visited += 1;
+                pb.set_position(pages_visited as u64);
+                pb.set_length(pb.length().unwrap_or(0) + issue_count as u64);
+
+                for link in links {
+                    let child = state.child(&link, "link");
+                    let fp = child.fingerprint();
+                    if tracker.visit(&fp) {
+                        queue.push_back(child);
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                pb.println(format!(
+                    "  {} {} — {}",
+                    style("⚠").yellow(),
+                    state.url,
+                    e
+                ));
+            }
+            Err(_) => {
+                pb.println(format!(
+                    "  {} {} — timed out (>{}s), skipped",
+                    style("⚠").yellow(),
+                    state.url,
+                    PAGE_TIMEOUT.as_secs()
+                ));
+            }
+        }
+    }
+
+    pb.finish_and_clear();
+    println!(
+        "  {} Crawled {} page{}  ({} issue{})",
+        style("✓").green().bold(),
+        pages_visited,
+        if pages_visited == 1 { "" } else { "s" },
+        all_issues.len(),
+        if all_issues.len() == 1 { "" } else { "s" }
+    );
+
+    page.close().await.ok();
+
+    Ok(CrawlResult {
+        issues: all_issues,
+        perf_metrics: all_perf,
+        network_stats: all_network,
+        stats: CrawlStats {
+            pages_visited,
+            elements_interacted: 0,
+            states_explored: pages_visited,
+            duration_secs: start.elapsed().as_secs_f64(),
+        },
+    })
+}
+
+/// Navigate to a URL, collect issues + perf, and optionally discover links.
+/// Returns (issues, perf, links).
+async fn audit_and_discover(
+    page: &chromiumoxide::Page,
+    url: &str,
+    base_host: &str,
+    settle_ms: u64,
+    discover: bool,
+) -> Result<(Vec<Issue>, PerfMetrics, NetworkStats, Vec<String>)> {
+    // Navigate — ignore non-fatal goto errors (SPA might "fail" on hash routes)
+    let goto_result = tokio::time::timeout(Duration::from_secs(12), page.goto(url)).await;
+    match goto_result {
+        Err(_) => anyhow::bail!("goto timed out after 12s"),
+        Ok(Err(e)) => {
+            // Log but don't abort: chromiumoxide sometimes returns an error even
+            // when the page did load (e.g., net::ERR_ABORTED on redirected resources).
+            // We continue and let the readyState poll tell us if it actually loaded.
+            let msg = e.to_string();
+            if msg.contains("net::ERR_CONNECTION_REFUSED")
+                || msg.contains("net::ERR_NAME_NOT_RESOLVED")
+            {
+                anyhow::bail!("{}", msg);
+            }
+        }
+        Ok(Ok(_)) => {}
+    }
+
+    wait_for_dom_ready(page, Duration::from_secs(8)).await;
+
+    if settle_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+    }
+
+    // Collect issues, perf, and links in a single JS round-trip
+    let base_host_js = base_host.to_string();
+    let js = format!(
+        r#"
+    (() => {{
+        const issues = [];
+
+        // Console errors / warnings captured by injected collector
+        for (const e of (window.__wp_errors || [])) {{
+            issues.push({{
+                sev: (e.type === 'rejection' || e.type === 'uncaught') ? 'error' : e.type,
+                cat: 'console_error',
+                msg: e.msg
+            }});
+        }}
+
+        // Accessibility: images without alt
+        document.querySelectorAll('img:not([alt])').forEach(el => {{
+            issues.push({{ sev: 'warning', cat: 'accessibility',
+                msg: 'Image missing alt attribute',
+                el: el.outerHTML.slice(0, 120) }});
+        }});
+
+        // Accessibility: inputs without label
+        document.querySelectorAll(
+            'input:not([type="hidden"]):not([aria-label]):not([aria-labelledby])'
+        ).forEach(el => {{
+            if (!el.id || !document.querySelector('label[for="' + el.id + '"]')) {{
+                issues.push({{ sev: 'warning', cat: 'accessibility',
+                    msg: 'Input missing label / aria-label',
+                    el: el.outerHTML.slice(0, 120) }});
+            }}
+        }});
+
+        // Accessibility: buttons with no accessible text
+        document.querySelectorAll('button:not([aria-label]):not([aria-labelledby])').forEach(el => {{
+            if (!el.textContent.trim()) {{
+                issues.push({{ sev: 'warning', cat: 'accessibility',
+                    msg: 'Button has no accessible text',
+                    el: el.outerHTML.slice(0, 120) }});
+            }}
+        }});
+
+        // Link discovery (SPA-aware — uses rendered DOM hrefs)
+        const links = [];
+        if ({discover}) {{
+            const seen = new Set();
+            document.querySelectorAll('a[href]').forEach(el => {{
+                try {{
+                    const u = new URL(el.href, location.href);
+                    if (u.host !== '{base_host}') return;
+                    u.hash = '';
+                    u.search = '';
+                    const key = u.toString();
+                    if (!seen.has(key)) {{
+                        seen.add(key);
+                        links.push(key);
+                    }}
+                }} catch (_) {{}}
+            }});
+        }}
+
+        // Performance timing
+        const nav = performance.getEntriesByType('navigation')[0] || {{}};
+        const paint = {{}};
+        performance.getEntriesByType('paint').forEach(e => {{ paint[e.name] = e.startTime; }});
+        const lcpEntries = performance.getEntriesByType('largest-contentful-paint');
+        const lcp = lcpEntries.length ? lcpEntries[lcpEntries.length - 1].startTime : null;
+
+        // Network statistics from Navigation Timing API
+        const dns = (nav.domainLookupEnd != null && nav.domainLookupStart != null)
+            ? nav.domainLookupEnd - nav.domainLookupStart : null;
+        const tcp = (nav.connectEnd != null && nav.connectStart != null)
+            ? nav.connectEnd - nav.connectStart : null;
+        const tls = (nav.secureConnectionStart > 0 && nav.connectEnd != null)
+            ? nav.connectEnd - nav.secureConnectionStart : null;
+        const ttfb = (nav.responseStart != null && nav.requestStart != null)
+            ? nav.responseStart - nav.requestStart : null;
+        const download = (nav.responseEnd != null && nav.responseStart != null)
+            ? nav.responseEnd - nav.responseStart : null;
+
+        // Sub-resource stats
+        const resources = performance.getEntriesByType('resource');
+        let totalBytes = 0;
+        let failedCount = 0;
+        let slowestMs = 0;
+        let slowestUrl = null;
+        for (const r of resources) {{
+            if (r.transferSize) totalBytes += r.transferSize;
+            if (r.duration < 1 && r.transferSize === 0 && r.decodedBodySize === 0) failedCount++;
+            if (r.duration > slowestMs) {{ slowestMs = r.duration; slowestUrl = r.name; }}
+        }}
+
+        return JSON.stringify({{
+            issues,
+            links,
+            perf: {{
+                fcp: paint['first-contentful-paint'] || null,
+                lcp: lcp,
+                dcl: nav.domContentLoadedEventEnd || null,
+                load: nav.loadEventEnd || null
+            }},
+            net: {{
+                dns,
+                tcp,
+                tls,
+                ttfb,
+                download,
+                resource_count: resources.length,
+                failed_resource_count: failedCount,
+                total_transfer_kb: totalBytes / 1024,
+                slowest_ms: slowestMs > 0 ? slowestMs : null,
+                slowest_url: slowestUrl
+            }}
+        }});
+    }})()
+    "#,
+        discover = if discover { "true" } else { "false" },
+        base_host = base_host_js,
+    );
+
+    let raw = page
+        .evaluate(js.as_str())
+        .await
+        .ok()
+        .and_then(|r| r.value().and_then(|v| v.as_str().map(|s| s.to_string())))
+        .unwrap_or_else(|| r#"{"issues":[],"links":[],"perf":{},"net":{}}"#.to_string());
+
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+
+    // Parse issues
+    let mut page_issues: Vec<Issue> = Vec::new();
+    if let Some(arr) = v["issues"].as_array() {
+        for item in arr {
+            let severity = match item["sev"].as_str().unwrap_or("info") {
+                "error" | "uncaught" | "rejection" => Severity::Error,
+                "warning" => Severity::Warning,
+                _ => Severity::Info,
+            };
+            let category = match item["cat"].as_str().unwrap_or("") {
+                "accessibility" => IssueCategory::Accessibility,
+                _ => IssueCategory::ConsoleError,
+            };
+            page_issues.push(Issue {
+                severity,
+                category,
+                message: item["msg"].as_str().unwrap_or("").to_string(),
+                page_url: url.to_string(),
+                element: item["el"].as_str().map(|s| s.to_string()),
+                action_path: vec![],
+            });
+        }
+    }
+
+    // Parse links
+    let links: Vec<String> = v["links"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Parse perf + flag slow pages
+    let p = &v["perf"];
+    let load = p["load"].as_f64();
+    if let Some(l) = load {
+        if l > 3000.0 {
+            page_issues.push(Issue {
+                severity: Severity::Warning,
+                category: IssueCategory::Performance,
+                message: format!("Slow page load: {:.0}ms (threshold 3s)", l),
+                page_url: url.to_string(),
+                element: None,
+                action_path: vec![],
+            });
+        }
+    }
+
+    let perf = PerfMetrics {
+        page_url: url.to_string(),
+        fcp_ms: p["fcp"].as_f64(),
+        lcp_ms: p["lcp"].as_f64(),
+        dom_content_loaded_ms: p["dcl"].as_f64(),
+        load_ms: load,
+        ..Default::default()
+    };
+
+    let n = &v["net"];
+    let net = NetworkStats {
+        page_url: url.to_string(),
+        dns_ms: n["dns"].as_f64(),
+        tcp_connect_ms: n["tcp"].as_f64(),
+        tls_ms: n["tls"].as_f64(),
+        ttfb_ms: n["ttfb"].as_f64(),
+        download_ms: n["download"].as_f64(),
+        resource_count: n["resource_count"].as_u64().unwrap_or(0) as usize,
+        failed_resource_count: n["failed_resource_count"].as_u64().unwrap_or(0) as usize,
+        total_transfer_kb: n["total_transfer_kb"].as_f64().unwrap_or(0.0),
+        slowest_resource_ms: n["slowest_ms"].as_f64(),
+        slowest_resource_url: n["slowest_url"].as_str().map(|s| s.to_string()),
+    };
+
+    Ok((page_issues, perf, net, links))
+}
+
+/// Block images, fonts, and media via CDP — reduces Chrome rendering overhead.
+async fn block_heavy_resources(page: &chromiumoxide::Page) {
+    use chromiumoxide::cdp::browser_protocol::network::{EnableParams, SetBlockedUrLsParams};
+    page.execute(EnableParams::default()).await.ok();
+    page.execute(SetBlockedUrLsParams::new(vec![
+        "*.png".into(),
+        "*.jpg".into(),
+        "*.jpeg".into(),
+        "*.gif".into(),
+        "*.webp".into(),
+        "*.avif".into(),
+        "*.svg".into(),
+        "*.ico".into(),
+        "*.woff".into(),
+        "*.woff2".into(),
+        "*.ttf".into(),
+        "*.otf".into(),
+        "*.mp4".into(),
+        "*.webm".into(),
+        "*.mp3".into(),
+    ]))
+    .await
+    .ok();
+}
+
+/// Poll `document.readyState` until interactive/complete or timeout.
+async fn wait_for_dom_ready(page: &chromiumoxide::Page, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let state = page
+            .evaluate("document.readyState")
+            .await
+            .ok()
+            .and_then(|r| r.value().and_then(|v| v.as_str().map(|s| s.to_string())));
+
+        match state.as_deref() {
+            Some("complete") | Some("interactive") => break,
+            _ => tokio::time::sleep(Duration::from_millis(80)).await,
+        }
+    }
+}
+
+/// Inject cookies from a JSON file into the browser before crawling.
+/// Cookie file format: JSON array of `{ name, value, domain?, path?, secure?, httpOnly? }`.
+async fn inject_cookies(page: &chromiumoxide::Page, auth: &AuthConfig) -> Result<()> {
+    use chromiumoxide::cdp::browser_protocol::network::{CookieParam, EnableParams, SetCookiesParams};
+
+    let path = auth.cookies_file.as_ref().context("no cookie file")?;
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("Cannot read cookie file: {}", path.display()))?;
+    let entries: Vec<CookieEntry> = serde_json::from_str(&raw)
+        .context("Cookie file must be a JSON array of { name, value, domain?, path?, ... }")?;
+
+    page.execute(EnableParams::default()).await.ok();
+
+    let cookies: Vec<CookieParam> = entries
+        .into_iter()
+        .map(|e| {
+            let mut b = CookieParam::builder().name(e.name).value(e.value);
+            if let Some(d) = e.domain { b = b.domain(d); }
+            if let Some(path_val) = e.path { b = b.path(path_val); }
+            if let Some(s) = e.secure { b = b.secure(s); }
+            if let Some(h) = e.http_only { b = b.http_only(h); }
+            b.build().unwrap()
+        })
+        .collect();
+
+    page.execute(SetCookiesParams::new(cookies)).await?;
+    Ok(())
+}
+
+/// Navigate to the login page, fill credentials, submit the form,
+/// and wait for the resulting navigation (auth redirect).
+async fn perform_login(
+    page: &chromiumoxide::Page,
+    auth: &AuthConfig,
+    base_url: &str,
+    settle_ms: u64,
+) -> Result<()> {
+    let login_url = match &auth.login_url {
+        Some(u) if u.starts_with("http://") || u.starts_with("https://") => u.clone(),
+        Some(path) => format!("{}/{}", base_url.trim_end_matches('/'), path.trim_start_matches('/')),
+        None => anyhow::bail!("No login URL provided"),
+    };
+
+    tokio::time::timeout(Duration::from_secs(12), page.goto(&login_url))
+        .await
+        .context("goto login page timed out")??;
+    wait_for_dom_ready(page, Duration::from_secs(8)).await;
+
+    let username = auth.username.as_deref().unwrap_or("");
+    let password = auth.password.as_deref().unwrap_or("");
+
+    // CSS selectors with sensible defaults — try user-provided selector first
+    let user_sel = auth
+        .username_selector
+        .as_deref()
+        .unwrap_or("input[type='email'],input[name='username'],input[name='email'],input[id*='user' i],input[id*='email' i],input[placeholder*='email' i],input[placeholder*='username' i]");
+    let pass_sel = auth
+        .password_selector
+        .as_deref()
+        .unwrap_or("input[type='password']");
+    let submit_sel = auth
+        .submit_selector
+        .as_deref()
+        .unwrap_or("button[type='submit'],input[type='submit'],button:last-of-type");
+
+    // Fill form using React-compatible native value setter trick
+    let fill_js = format!(
+        r#"
+    (() => {{
+        function fill(sel, val) {{
+            const el = document.querySelector(sel);
+            if (!el) return false;
+            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            nativeSetter.call(el, val);
+            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            return true;
+        }}
+        const userOk = fill({user_sel:?}, {username:?});
+        const passOk = fill({pass_sel:?}, {password:?});
+        return JSON.stringify({{ userOk, passOk }});
+    }})()
+    "#,
+        user_sel = user_sel,
+        username = username,
+        pass_sel = pass_sel,
+        password = password,
+    );
+
+    let fill_result = page
+        .evaluate(fill_js.as_str())
+        .await
+        .ok()
+        .and_then(|r| r.value().and_then(|v| v.as_str().map(|s| s.to_string())))
+        .unwrap_or_default();
+
+    let fill_v: serde_json::Value = serde_json::from_str(&fill_result).unwrap_or_default();
+    if fill_v["userOk"].as_bool() != Some(true) {
+        anyhow::bail!("Could not find username field (tried: {})", user_sel);
+    }
+    if fill_v["passOk"].as_bool() != Some(true) {
+        anyhow::bail!("Could not find password field (tried: {})", pass_sel);
+    }
+
+    // Submit and wait for navigation
+    let submit_js = format!(
+        r#"
+    (() => {{
+        const btn = document.querySelector({submit_sel:?});
+        if (!btn) return false;
+        btn.click();
+        return true;
+    }})()
+    "#,
+        submit_sel = submit_sel,
+    );
+
+    page.evaluate(submit_js.as_str()).await.ok();
+
+    // Wait for the post-login navigation to settle
+    tokio::time::sleep(Duration::from_millis(settle_ms.max(800))).await;
+    wait_for_dom_ready(page, Duration::from_secs(8)).await;
+
+    Ok(())
+}

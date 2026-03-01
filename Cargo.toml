@@ -1,0 +1,59 @@
+[package]
+name = "webprobe"
+version = "0.1.0"
+edition = "2024"
+description = "Exhaustive web crawler and load tester for localhost development"
+
+[[bin]]
+name = "webprobe"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Browser automation via Chrome DevTools Protocol
+chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# HTTP load testing
+reqwest = { version = "0.12", features = ["json", "gzip"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Terminal output
+console = "0.15"
+indicatif = { version = "0.17", features = ["tokio"] }
+
+# URL handling
+url = "2"
+
+# HTML parsing (static fallback)
+scraper = "0.20"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Concurrency utilities
+dashmap = "6"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Stats (HDR histogram for latency percentiles)
+hdrhistogram = "7"
+
+# Async channel for BFS queue
+async-channel = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
