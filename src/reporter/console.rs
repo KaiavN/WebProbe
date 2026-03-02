@@ -60,6 +60,14 @@ pub fn print_report(report: &Report) {
             style("  ── Performance ──────────────────────────────────────────").dim()
         );
         for p in &report.perf_metrics {
+            let has_data = p.fcp_ms.is_some()
+                || p.lcp_ms.is_some()
+                || p.load_ms.is_some()
+                || p.dom_content_loaded_ms.is_some()
+                || p.cls_score.is_some();
+            if !has_data {
+                continue;
+            }
             println!("  {}", style(&p.page_url).dim());
             if let Some(fcp) = p.fcp_ms {
                 let s = perf_color(fcp, 1800.0, 3000.0);
@@ -68,6 +76,18 @@ pub fn print_report(report: &Report) {
             if let Some(lcp) = p.lcp_ms {
                 let s = perf_color(lcp, 2500.0, 4000.0);
                 println!("    LCP:  {}ms", s(format!("{:.0}", lcp)));
+            }
+            if let Some(tti) = p.tti_ms {
+                let s = perf_color(tti, 3800.0, 7300.0);
+                println!("    TTI:  {}ms", s(format!("{:.0}", tti)));
+            }
+            if let Some(cls) = p.cls_score {
+                let s = perf_color(cls, 0.1, 0.25);
+                println!("    CLS:  {}", s(format!("{:.3}", cls)));
+            }
+            if let Some(tbt) = p.tbt_ms {
+                let s = perf_color(tbt, 200.0, 600.0);
+                println!("    TBT:  {}ms", s(format!("{:.0}", tbt)));
             }
             if let Some(load) = p.load_ms {
                 let s = perf_color(load, 2000.0, 4000.0);
@@ -108,7 +128,18 @@ pub fn print_report(report: &Report) {
                 n.resource_count, n.failed_resource_count, n.total_transfer_kb
             );
             if let (Some(ms), Some(url)) = (n.slowest_resource_ms, &n.slowest_resource_url) {
-                let short_url = if url.len() > 60 { &url[url.len()-60..] } else { url.as_str() };
+                let short_url_owned;
+                let short_url = if url.len() > 60 {
+                    let start = url.char_indices()
+                        .rev()
+                        .nth(59)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    short_url_owned = &url[start..];
+                    short_url_owned
+                } else {
+                    url.as_str()
+                };
                 println!("    Slowest:   {:.0}ms  …{}", ms, style(short_url).dim());
             }
         }
@@ -132,8 +163,8 @@ pub fn print_report(report: &Report) {
             lt.error_rate_pct
         );
         println!(
-            "  Latency  p50:{:.0}ms  p90:{:.0}ms  p95:{:.0}ms  p99:{:.0}ms  max:{:.0}ms",
-            lt.latency_p50_ms, lt.latency_p90_ms, lt.latency_p95_ms, lt.latency_p99_ms, lt.latency_max_ms
+            "  Latency  mean:{:.0}ms  p50:{:.0}ms  p90:{:.0}ms  p95:{:.0}ms  p99:{:.0}ms  max:{:.0}ms",
+            lt.latency_mean_ms, lt.latency_p50_ms, lt.latency_p90_ms, lt.latency_p95_ms, lt.latency_p99_ms, lt.latency_max_ms
         );
     }
 

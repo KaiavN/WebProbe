@@ -15,7 +15,9 @@ pub struct LoadConfig {
 }
 
 pub async fn run_load_test(config: LoadConfig) -> Result<LoadTestResult> {
-    assert!(!config.urls.is_empty(), "LoadConfig.urls must not be empty");
+    if config.urls.is_empty() {
+        anyhow::bail!("No URLs provided for load test");
+    }
 
     let urls = Arc::new(config.urls.clone());
 
@@ -34,7 +36,7 @@ pub async fn run_load_test(config: LoadConfig) -> Result<LoadTestResult> {
         ProgressStyle::with_template(
             " {spinner:.yellow} Load test [{bar:40.yellow/white}] {pos}/{len}s  {msg}",
         )
-        .unwrap()
+        .expect("invalid progress template")
         .progress_chars("█▉▊▋▌▍▎▏ "),
     );
     pb.enable_steady_tick(Duration::from_millis(100));
@@ -53,7 +55,7 @@ pub async fn run_load_test(config: LoadConfig) -> Result<LoadTestResult> {
         let start_offset = worker_id as usize;
 
         handles.push(tokio::spawn(async move {
-            let mut local_hist: Histogram<u64> = Histogram::new(3).unwrap();
+            let mut local_hist: Histogram<u64> = Histogram::new(3).expect("failed to create histogram");
             let mut req_count: usize = start_offset;
             while Instant::now() < deadline {
                 let url = &urls[req_count % urls.len()];

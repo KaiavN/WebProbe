@@ -9,15 +9,15 @@ use std::fmt;
 pub struct AuthConfig {
     /// URL of the login page (path like "/login" or full URL)
     pub login_url: Option<String>,
-    /// Username / email to fill in
+    /// Username / email to fill in (requires browser; ignored in HTTP mode)
     pub username: Option<String>,
-    /// Password to fill in
+    /// Password to fill in (requires browser; ignored in HTTP mode)
     pub password: Option<String>,
-    /// CSS selector for the username/email field (auto-detected if None)
+    /// CSS selector for the username/email field (requires browser; ignored in HTTP mode)
     pub username_selector: Option<String>,
-    /// CSS selector for the password field (auto-detected if None)
+    /// CSS selector for the password field (requires browser; ignored in HTTP mode)
     pub password_selector: Option<String>,
-    /// CSS selector for the submit button (auto-detected if None)
+    /// CSS selector for the submit button (requires browser; ignored in HTTP mode)
     pub submit_selector: Option<String>,
     /// Path to a JSON cookie file to inject before crawling
     pub cookies_file: Option<std::path::PathBuf>,
@@ -109,40 +109,6 @@ pub struct Issue {
     pub action_path: Vec<String>,
 }
 
-// ── Element Actions ──────────────────────────────────────────────────────────
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ElementAction {
-    Click { selector: String, label: String },
-    Navigate { href: String },
-    FillForm { selector: String, value: String },
-    SelectOption { selector: String, value: String },
-    CheckBox { selector: String, checked: bool },
-    SubmitForm { selector: String },
-}
-
-impl ElementAction {
-    #[allow(dead_code)]
-    pub fn label(&self) -> String {
-        match self {
-            ElementAction::Click { label, .. } => format!("click:{label}"),
-            ElementAction::Navigate { href } => format!("nav:{href}"),
-            ElementAction::FillForm { selector, value } => {
-                format!("fill:{selector}={value}")
-            }
-            ElementAction::SelectOption { selector, value } => {
-                format!("select:{selector}={value}")
-            }
-            ElementAction::CheckBox { selector, checked } => {
-                format!("check:{selector}={checked}")
-            }
-            ElementAction::SubmitForm { selector } => format!("submit:{selector}"),
-        }
-    }
-}
-
 // ── Page State ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -155,8 +121,15 @@ pub struct PageState {
 
 impl PageState {
     pub fn new(url: impl Into<String>) -> Self {
+        let raw: String = url.into();
+        // Normalize trailing slash (except bare "/" or "scheme://host/")
+        let url = if raw.ends_with('/') && raw.len() > 1 && !raw.ends_with("://") {
+            raw.trim_end_matches('/').to_string()
+        } else {
+            raw
+        };
         Self {
-            url: url.into(),
+            url,
             action_path: vec![],
             depth: 0,
         }
@@ -166,7 +139,15 @@ impl PageState {
     pub fn fingerprint(&self) -> String {
         let mut sorted_path = self.action_path.clone();
         sorted_path.sort();
-        format!("{}|{}", self.url, sorted_path.join(";"))
+        // Normalize URL: strip trailing slash (except root /)
+        let norm_url = if self.url.ends_with('/') && self.url.len() > 1
+            && !self.url.ends_with("://")
+        {
+            self.url.trim_end_matches('/').to_string()
+        } else {
+            self.url.clone()
+        };
+        format!("{}|{}", norm_url, sorted_path.join(";"))
     }
 
     pub fn child(&self, url: impl Into<String>, action: &str) -> Self {

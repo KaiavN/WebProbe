@@ -21,14 +21,5 @@ impl StateTracker {
         self.visited.insert(fingerprint.to_string())
     }
 
-    /// Peek without marking visited (used for pre-queue dedup).
-    #[allow(dead_code)]
-    pub fn is_visited(&self, fingerprint: &str) -> bool {
-        self.visited.contains(fingerprint)
-    }
 
-    #[allow(dead_code)]
-    pub fn count(&self) -> usize {
-        self.visited.len()
-    }
 }
