@@ -159,10 +159,12 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
 
     // ── Auth ─────────────────────────────────────────────────────────────────
     if let Some(cookies_file) = &config.auth.cookies_file {
-        if let Err(e) = inject_cookies(&sessions[0], &config.start_url, cookies_file).await {
-            eprintln!("  {} Cookie injection failed: {}", style("⚠").yellow(), e);
-        } else {
-            println!("  {} Cookies injected", style("✓").green());
+        // Inject file cookies into ALL sessions so each worker is authenticated.
+        for (idx, sess) in sessions.iter().enumerate() {
+            match inject_cookies(sess, &config.start_url, cookies_file).await {
+                Ok(()) => { if idx == 0 { println!("  {} Cookies injected", style("✓").green()); } }
+                Err(e) => { if idx == 0 { eprintln!("  {} Cookie injection failed: {}", style("⚠").yellow(), e); } }
+            }
         }
     }
 
@@ -170,7 +172,23 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
         print!("  {} Authenticating… ", style("→").cyan());
         match perform_login(&sessions[0], &config.auth, &config.start_url, config.settle_ms).await
         {
-            Ok(()) => println!("{}", style("ok").green().bold()),
+            Ok(()) => {
+                println!("{}", style("ok").green().bold());
+                // Replicate auth cookies from sessions[0] to all other sessions so that
+                // every concurrent worker crawls as the authenticated user.
+                if sessions.len() > 1 {
+                    if let Ok(cookies) = sessions[0].get_all_cookies().await {
+                        for sess in sessions.iter().skip(1) {
+                            // Must be on the target domain before adding cookies.
+                            sess.goto(&config.start_url).await.ok();
+                            wait_for_dom_ready(sess, Duration::from_secs(5)).await;
+                            for c in &cookies {
+                                sess.add_cookie(c.clone()).await.ok();
+                            }
+                        }
+                    }
+                }
+            }
             Err(e) => {
                 println!("{}", style("failed").red().bold());
                 eprintln!("  {} Login failed: {}", style("⚠").red().bold(), e);
@@ -516,7 +534,8 @@ fn build_collect_js(base_host: &str, discover: bool, link_selector: Option<&str>
         }});
 
         document.querySelectorAll(
-            'input:not([type="hidden"]):not([aria-label]):not([aria-labelledby])'
+            'input:not([type="hidden"]):not([type="submit"]):not([type="button"])' +
+            ':not([type="reset"]):not([type="image"]):not([aria-label]):not([aria-labelledby])'
         ).forEach(function(el) {{
             if (!el.id || !document.querySelector('label[for="' + el.id + '"]')) {{
                 issues.push({{ sev:'warning', cat:'accessibility',
@@ -561,7 +580,7 @@ fn build_collect_js(base_host: &str, discover: bool, link_selector: Option<&str>
             {anchor_query}.forEach(function(el) {{
                 try {{
                     var u = new URL(el.href, location.href);
-                    if (u.host !== '{base_host}') return;
+                    if (u.host !== {base_host_json}) return;
                     u.hash = ''; u.search = '';
                     if (u.pathname !== '/' && u.pathname.endsWith('/')) {{
                         u.pathname = u.pathname.slice(0, -1);
@@ -653,7 +672,7 @@ fn build_collect_js(base_host: &str, discover: bool, link_selector: Option<&str>
 }})()
 "#,
         discover = if discover { "true" } else { "false" },
-        base_host = base_host,
+        base_host_json = serde_json::to_string(base_host).unwrap_or_else(|_| format!("\"{}\"", base_host)),
         anchor_query = anchor_query,
     )
 }
@@ -760,6 +779,16 @@ async fn perform_login(
 ) -> Result<()> {
     let login_url = match &auth.login_url {
         Some(u) if u.starts_with("http://") || u.starts_with("https://") => u.clone(),
+        Some(path) if path.starts_with('/') => {
+            // Root-relative path: use only the origin (scheme + host + port), ignore base_url path.
+            // e.g. base_url="http://localhost:3000/app", path="/login" → "http://localhost:3000/login"
+            let base = Url::parse(base_url).unwrap_or_else(|_| Url::parse("http://localhost").unwrap());
+            let mut origin = format!("{}://{}", base.scheme(), base.host_str().unwrap_or("localhost"));
+            if let Some(port) = base.port() {
+                origin.push_str(&format!(":{}", port));
+            }
+            format!("{}{}", origin, path)
+        }
         Some(path) => format!(
             "{}/{}",
             base_url.trim_end_matches('/'),
@@ -900,7 +929,19 @@ async fn perform_login(
         .context("Failed to type into username field")?;
 
     // ── Multi-step login: if password field isn't visible yet, click "Next" ──
-    let password_immediately_visible = client.find(Locator::Css("input[type='password']")).await.is_ok();
+    // Use JS visibility check (offsetParent/offsetWidth) rather than WebDriver find(),
+    // which returns true for hidden elements too — avoids clicking submit prematurely
+    // on single-page forms where the password field is in the DOM but display:none.
+    let password_immediately_visible = client
+        .execute(
+            "var el = document.querySelector(\"input[type='password']\"); \
+             return !!(el && el.offsetParent !== null && el.offsetWidth > 0 && el.offsetHeight > 0);",
+            vec![],
+        )
+        .await
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if !password_immediately_visible {
         if let Some(next_btn) = find_first(client, &[
             "button[type='submit']",
@@ -1017,7 +1058,18 @@ async fn perform_login(
     // ── Login verification ────────────────────────────────────────────────────
     if let Ok(current_url) = client.current_url().await {
         let current = current_url.as_str();
-        if current.starts_with(login_url.as_str()) || current.contains("/login") || current.contains("/signin") {
+        // Check if we're still on the login page: exact prefix match, or a path segment
+        // matches known auth keywords. Using segment matching avoids false positives like
+        // "/settings/login-history" or "/dashboard?from=login".
+        let still_on_login = current.starts_with(login_url.as_str()) || {
+            Url::parse(current).ok().map(|u| {
+                let path = u.path().to_lowercase();
+                path.split('/').any(|seg| {
+                    matches!(seg, "login" | "signin" | "sign-in" | "auth" | "authenticate")
+                })
+            }).unwrap_or(false)
+        };
+        if still_on_login {
             eprintln!(
                 "  {} Login may have failed — still on login page: {}",
                 console::style("⚠").yellow().bold(),

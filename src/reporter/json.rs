@@ -3,6 +3,13 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 pub fn write_report(report: &Report, path: &Path) -> Result<()> {
+    // Ensure parent directory exists
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+        }
+    }
     let json = serde_json::to_string_pretty(report)
         .context("Failed to serialize report to JSON")?;
     std::fs::write(path, json)

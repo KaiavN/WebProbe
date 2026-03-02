@@ -28,14 +28,71 @@ pub fn print_report(report: &Report) {
     if report.issues.is_empty() {
         println!("\n  {} No issues found!\n", style("✓").green().bold());
     } else {
-        // Group by page_url
+        // Deduplicate: issues appearing on many pages are shown once as "global" issues
+        // to avoid flooding the output (e.g. "missing lang attr" on every page).
+        let dedup_threshold = 3usize;
+        let mut freq: std::collections::HashMap<String, Vec<&str>> =
+            std::collections::HashMap::new();
+        for issue in &report.issues {
+            let key = format!("{}|{}", issue.category, issue.message);
+            freq.entry(key).or_default().push(issue.page_url.as_str());
+        }
+        // Keys considered "global" (appear on many pages)
+        let global_keys: std::collections::HashSet<String> = freq
+            .iter()
+            .filter(|(_, pages)| pages.len() >= dedup_threshold)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        // ── Global / site-wide issues ──────────────────────────────────────
+        if !global_keys.is_empty() {
+            println!(
+                "\n{}",
+                style("  ── Site-wide Issues ──────────────────────────────────────").dim()
+            );
+            let mut global_issues: Vec<_> = report
+                .issues
+                .iter()
+                .filter(|i| global_keys.contains(&format!("{}|{}", i.category, i.message)))
+                // deduplicate to one entry per (category, message)
+                .fold(
+                    std::collections::BTreeMap::<String, &crate::types::Issue>::new(),
+                    |mut m, i| {
+                        let k = format!("{}|{}", i.category, i.message);
+                        m.entry(k).or_insert(i);
+                        m
+                    },
+                )
+                .into_values()
+                .collect();
+            global_issues.sort_by(|a, b| b.severity.cmp(&a.severity));
+            for issue in global_issues {
+                let key = format!("{}|{}", issue.category, issue.message);
+                let n_pages = freq[&key].len();
+                let (icon, sev_str) = severity_style(&issue.severity);
+                let cat = style(format!("[{}]", issue.category)).dim();
+                println!(
+                    "    {} {} {} {}  {}",
+                    icon,
+                    sev_str,
+                    cat,
+                    issue.message,
+                    style(format!("(on {} pages)", n_pages)).dim()
+                );
+            }
+        }
+
+        // ── Per-page issues (excluding global ones) ────────────────────────
         let mut by_page: std::collections::BTreeMap<&str, Vec<_>> =
             std::collections::BTreeMap::new();
         for issue in &report.issues {
-            by_page
-                .entry(issue.page_url.as_str())
-                .or_default()
-                .push(issue);
+            let key = format!("{}|{}", issue.category, issue.message);
+            if !global_keys.contains(&key) {
+                by_page
+                    .entry(issue.page_url.as_str())
+                    .or_default()
+                    .push(issue);
+            }
         }
 
         for (page, issues) in &by_page {
