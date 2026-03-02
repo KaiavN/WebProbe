@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use url::Url;
 
-const PAGE_TIMEOUT: Duration = Duration::from_secs(20);
+const PAGE_TIMEOUT: Duration = Duration::from_secs(30);
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct CrawlerConfig {
@@ -46,6 +46,15 @@ pub struct CrawlResult {
 /// Open a browser session — capabilities differ between Firefox, Chrome, and Safari.
 async fn new_session(driver_url: &str, headless: bool, kind: DriverKind) -> Result<Client> {
     let mut caps = serde_json::Map::new();
+
+    // "eager" page load strategy: goto returns on DOMContentLoaded instead of waiting
+    // for every asset (images, fonts, Vite HMR modules, etc.) to finish loading.
+    // DOM auditing and buffered PerformanceObservers still capture everything we need.
+    caps.insert(
+        "pageLoadStrategy".to_string(),
+        serde_json::json!("eager"),
+    );
+
     match kind {
         DriverKind::Gecko => {
             // Firefox supports headless via -headless arg.
@@ -377,9 +386,9 @@ async fn audit_page(
     link_selector: Option<&str>,
 ) -> Result<(Vec<Issue>, PerfMetrics, NetworkStats, Vec<String>)> {
     // Navigate (ignore "soft" errors that still land on the page)
-    let goto = tokio::time::timeout(Duration::from_secs(12), client.goto(url)).await;
+    let goto = tokio::time::timeout(Duration::from_secs(15), client.goto(url)).await;
     match goto {
-        Err(_) => anyhow::bail!("goto timed out after 12s"),
+        Err(_) => anyhow::bail!("goto timed out after 15s"),
         Ok(Err(e)) => {
             let msg = e.to_string();
             if msg.contains("net::ERR_CONNECTION_REFUSED")
@@ -392,7 +401,7 @@ async fn audit_page(
         Ok(Ok(())) => {}
     }
 
-    wait_for_dom_ready(client, Duration::from_secs(8)).await;
+    wait_for_dom_ready(client, Duration::from_secs(5)).await;
 
     if settle_ms > 0 {
         tokio::time::sleep(Duration::from_millis(settle_ms)).await;
@@ -499,15 +508,12 @@ async fn audit_page(
 
 /// Build the async JS collection script for a given page.
 /// The script:
-///   1. Runs all static audits (accessibility, SEO) synchronously.
-///   2. Discovers links synchronously.
-///   3. Reads Navigation Timing, paint entries, and resource stats synchronously.
-///   4. Sets up PerformanceObservers with `buffered:true` for LCP and CLS.
-///   5. Calls the WebDriver async callback once both observers have fired
-///      (or after a 500 ms safety timeout, whichever comes first).
+///   1. If the DOM already has meaningful content, runs audits immediately.
+///   2. Otherwise (SPA shell), installs a MutationObserver and waits for
+///      content to appear before auditing — no Rust-side polling required.
+///   3. Sets up PerformanceObservers with `buffered:true` for LCP and CLS.
+///   4. Hard safety timeout (8 s) ensures the callback is always called.
 fn build_collect_js(base_host: &str, discover: bool, link_selector: Option<&str>) -> String {
-    // Build the JS expression that produces the NodeList of <a> elements to scan.
-    // If a link_selector is given, only follow links inside the first matching element.
     let anchor_query = match link_selector {
         Some(sel) => format!(
             "(document.querySelector({sel_json}) || document).querySelectorAll('a[href]')",
@@ -524,150 +530,181 @@ fn build_collect_js(base_host: &str, discover: bool, link_selector: Option<&str>
         if (!_called) {{ _called = true; cb(JSON.stringify(data)); }}
     }};
 
-    try {{
-        // ── Accessibility & SEO issues ────────────────────────────────────────
-        var issues = [];
+    // Hard safety net: always resolve within 10s regardless
+    var safetyTimer = setTimeout(function() {{
+        done({{ issues:[], links:[], perf:{{}}, net:{{}}, lcp:null, cls:null }});
+    }}, 10000);
 
-        document.querySelectorAll('img:not([alt])').forEach(function(el) {{
-            issues.push({{ sev:'warning', cat:'accessibility',
-                msg:'Image missing alt attribute', el:el.outerHTML.slice(0,120) }});
-        }});
+    function runCollect() {{
+        clearTimeout(safetyTimer);
+        try {{
+            // ── Accessibility & SEO issues ────────────────────────────────────────
+            var issues = [];
 
-        document.querySelectorAll(
-            'input:not([type="hidden"]):not([type="submit"]):not([type="button"])' +
-            ':not([type="reset"]):not([type="image"]):not([aria-label]):not([aria-labelledby])'
-        ).forEach(function(el) {{
-            if (!el.id || !document.querySelector('label[for="' + el.id + '"]')) {{
+            document.querySelectorAll('img:not([alt])').forEach(function(el) {{
                 issues.push({{ sev:'warning', cat:'accessibility',
-                    msg:'Input missing label / aria-label', el:el.outerHTML.slice(0,120) }});
-            }}
-        }});
-
-        document.querySelectorAll('button:not([aria-label]):not([aria-labelledby])').forEach(function(el) {{
-            if (!el.textContent.trim()) {{
-                issues.push({{ sev:'warning', cat:'accessibility',
-                    msg:'Button has no accessible text', el:el.outerHTML.slice(0,120) }});
-            }}
-        }});
-
-        document.querySelectorAll('a:not([aria-label]):not([aria-labelledby])').forEach(function(el) {{
-            if (!el.textContent.trim() && !el.querySelector('img[alt]')) {{
-                issues.push({{ sev:'warning', cat:'accessibility',
-                    msg:'Link has no accessible text', el:el.outerHTML.slice(0,120) }});
-            }}
-        }});
-
-        var titleEl = document.querySelector('title');
-        if (!titleEl || !titleEl.textContent.trim()) {{
-            issues.push({{ sev:'warning', cat:'seo', msg:'Page is missing a <title> element' }});
-        }}
-        if (!document.documentElement.getAttribute('lang')) {{
-            issues.push({{ sev:'warning', cat:'accessibility',
-                msg:'<html> element is missing a lang attribute' }});
-        }}
-        if (!document.querySelector('meta[name="viewport"]')) {{
-            issues.push({{ sev:'info', cat:'seo',
-                msg:'Missing <meta name="viewport"> \u2014 page may render poorly on mobile' }});
-        }}
-        if (!document.querySelector('meta[name="description"]')) {{
-            issues.push({{ sev:'info', cat:'seo', msg:'Missing <meta name="description">' }});
-        }}
-
-        // ── Link discovery ────────────────────────────────────────────────────
-        var links = [];
-        if ({discover}) {{
-            var seen = new Set();
-            {anchor_query}.forEach(function(el) {{
-                try {{
-                    var u = new URL(el.href, location.href);
-                    if (u.host !== {base_host_json}) return;
-                    u.hash = ''; u.search = '';
-                    if (u.pathname !== '/' && u.pathname.endsWith('/')) {{
-                        u.pathname = u.pathname.slice(0, -1);
-                    }}
-                    var k = u.toString();
-                    if (!seen.has(k)) {{ seen.add(k); links.push(k); }}
-                }} catch(_) {{}}
+                    msg:'Image missing alt attribute', el:el.outerHTML.slice(0,120) }});
             }});
-        }}
 
-        // ── Navigation Timing (synchronous) ──────────────────────────────────
-        var nav = performance.getEntriesByType('navigation')[0] || {{}};
-        var paint = {{}};
-        performance.getEntriesByType('paint').forEach(function(e) {{ paint[e.name] = e.startTime; }});
+            document.querySelectorAll(
+                'input:not([type="hidden"]):not([type="submit"]):not([type="button"])' +
+                ':not([type="reset"]):not([type="image"]):not([aria-label]):not([aria-labelledby])'
+            ).forEach(function(el) {{
+                if (!el.id || !document.querySelector('label[for="' + el.id + '"]')) {{
+                    issues.push({{ sev:'warning', cat:'accessibility',
+                        msg:'Input missing label / aria-label', el:el.outerHTML.slice(0,120) }});
+                }}
+            }});
 
-        var dns  = (nav.domainLookupEnd  != null && nav.domainLookupStart != null)
-                   ? nav.domainLookupEnd  - nav.domainLookupStart : null;
-        var tcp  = (nav.connectEnd       != null && nav.connectStart      != null)
-                   ? nav.connectEnd       - nav.connectStart      : null;
-        var tls  = (nav.secureConnectionStart > 0 && nav.connectEnd != null)
-                   ? nav.connectEnd - nav.secureConnectionStart    : null;
-        var ttfb = (nav.responseStart    != null && nav.requestStart      != null)
-                   ? nav.responseStart   - nav.requestStart       : null;
-        var dl   = (nav.responseEnd      != null && nav.responseStart     != null)
-                   ? nav.responseEnd     - nav.responseStart      : null;
+            document.querySelectorAll('button:not([aria-label]):not([aria-labelledby])').forEach(function(el) {{
+                if (!el.textContent.trim()) {{
+                    issues.push({{ sev:'warning', cat:'accessibility',
+                        msg:'Button has no accessible text', el:el.outerHTML.slice(0,120) }});
+                }}
+            }});
 
-        var resources = performance.getEntriesByType('resource');
-        var totalBytes = 0, failedCount = 0, slowestMs = 0, slowestUrl = null;
-        for (var i = 0; i < resources.length; i++) {{
-            var r = resources[i];
-            if (r.transferSize) totalBytes += r.transferSize;
-            if (r.duration < 1 && r.transferSize === 0 && r.decodedBodySize === 0) failedCount++;
-            if (r.duration > slowestMs) {{ slowestMs = r.duration; slowestUrl = r.name; }}
-        }}
+            document.querySelectorAll('a:not([aria-label]):not([aria-labelledby])').forEach(function(el) {{
+                if (!el.textContent.trim() && !el.querySelector('img[alt]')) {{
+                    issues.push({{ sev:'warning', cat:'accessibility',
+                        msg:'Link has no accessible text', el:el.outerHTML.slice(0,120) }});
+                }}
+            }});
 
-        var collected = {{
-            issues: issues,
-            links:  links,
-            perf: {{
-                fcp:  paint['first-contentful-paint'] || null,
-                dcl:  nav.domContentLoadedEventEnd > 0 ? nav.domContentLoadedEventEnd : null,
-                load: nav.loadEventEnd   > 0 ? nav.loadEventEnd   : null,
-                tti:  nav.domInteractive > 0 ? nav.domInteractive : null
-            }},
-            net: {{
-                dns:  dns,  tcp: tcp, tls: tls, ttfb: ttfb, download: dl,
-                resource_count:        resources.length,
-                failed_resource_count: failedCount,
-                total_transfer_kb:     totalBytes / 1024,
-                slowest_ms:  slowestMs  > 0    ? slowestMs  : null,
-                slowest_url: slowestUrl !== null ? slowestUrl : null
-            }},
-            lcp: null,
-            cls: null
-        }};
+            var titleEl = document.querySelector('title');
+            if (!titleEl || !titleEl.textContent.trim()) {{
+                issues.push({{ sev:'warning', cat:'seo', msg:'Page is missing a <title> element' }});
+            }}
+            if (!document.documentElement.getAttribute('lang')) {{
+                issues.push({{ sev:'warning', cat:'accessibility',
+                    msg:'<html> element is missing a lang attribute' }});
+            }}
+            if (!document.querySelector('meta[name="viewport"]')) {{
+                issues.push({{ sev:'info', cat:'seo',
+                    msg:'Missing <meta name="viewport"> \u2014 page may render poorly on mobile' }});
+            }}
+            if (!document.querySelector('meta[name="description"]')) {{
+                issues.push({{ sev:'info', cat:'seo', msg:'Missing <meta name="description">' }});
+            }}
 
-        // ── LCP + CLS via buffered PerformanceObservers ───────────────────────
-        // The buffered flag causes already-recorded entries to be delivered
-        // synchronously into the callback queue, so this resolves very quickly.
-        var lcpDone = false, clsDone = false;
-        var clsTotal = 0;
-        var checkDone = function() {{ if (lcpDone && clsDone) done(collected); }};
-
-        try {{
-            new PerformanceObserver(function(list) {{
-                var e = list.getEntries();
-                if (e.length) collected.lcp = e[e.length - 1].startTime;
-                lcpDone = true; checkDone();
-            }}).observe({{ type: 'largest-contentful-paint', buffered: true }});
-        }} catch(_) {{ lcpDone = true; checkDone(); }}
-
-        try {{
-            new PerformanceObserver(function(list) {{
-                list.getEntries().forEach(function(e) {{
-                    if (!e.hadRecentInput) clsTotal += e.value;
+            // ── Link discovery ────────────────────────────────────────────────────
+            var links = [];
+            if ({discover}) {{
+                var seen = new Set();
+                {anchor_query}.forEach(function(el) {{
+                    try {{
+                        var u = new URL(el.href, location.href);
+                        if (u.host !== {base_host_json}) return;
+                        u.hash = ''; u.search = '';
+                        if (u.pathname !== '/' && u.pathname.endsWith('/')) {{
+                            u.pathname = u.pathname.slice(0, -1);
+                        }}
+                        var k = u.toString();
+                        if (!seen.has(k)) {{ seen.add(k); links.push(k); }}
+                    }} catch(_) {{}}
                 }});
-                collected.cls = clsTotal > 0 ? clsTotal : null;
-                clsDone = true; checkDone();
-            }}).observe({{ type: 'layout-shift', buffered: true }});
-        }} catch(_) {{ clsDone = true; checkDone(); }}
+            }}
 
-        // Safety net: deliver whatever we have after 500 ms
-        setTimeout(function() {{ lcpDone = true; clsDone = true; checkDone(); }}, 500);
+            // ── Navigation Timing (synchronous) ──────────────────────────────────
+            var nav = performance.getEntriesByType('navigation')[0] || {{}};
+            var paint = {{}};
+            performance.getEntriesByType('paint').forEach(function(e) {{ paint[e.name] = e.startTime; }});
 
-    }} catch(err) {{
-        // Never leave the WebDriver async callback hanging
-        done({{ issues:[], links:[], perf:{{}}, net:{{}}, lcp:null, cls:null, _error: err.toString() }});
+            var dns  = (nav.domainLookupEnd  != null && nav.domainLookupStart != null)
+                       ? nav.domainLookupEnd  - nav.domainLookupStart : null;
+            var tcp  = (nav.connectEnd       != null && nav.connectStart      != null)
+                       ? nav.connectEnd       - nav.connectStart      : null;
+            var tls  = (nav.secureConnectionStart > 0 && nav.connectEnd != null)
+                       ? nav.connectEnd - nav.secureConnectionStart    : null;
+            var ttfb = (nav.responseStart    != null && nav.requestStart      != null)
+                       ? nav.responseStart   - nav.requestStart       : null;
+            var dl   = (nav.responseEnd      != null && nav.responseStart     != null)
+                       ? nav.responseEnd     - nav.responseStart      : null;
+
+            var resources = performance.getEntriesByType('resource');
+            var totalBytes = 0, failedCount = 0, slowestMs = 0, slowestUrl = null;
+            for (var i = 0; i < resources.length; i++) {{
+                var r = resources[i];
+                if (r.transferSize) totalBytes += r.transferSize;
+                if (r.duration < 1 && r.transferSize === 0 && r.decodedBodySize === 0) failedCount++;
+                if (r.duration > slowestMs) {{ slowestMs = r.duration; slowestUrl = r.name; }}
+            }}
+
+            var collected = {{
+                issues: issues,
+                links:  links,
+                perf: {{
+                    fcp:  paint['first-contentful-paint'] || null,
+                    dcl:  nav.domContentLoadedEventEnd > 0 ? nav.domContentLoadedEventEnd : null,
+                    load: nav.loadEventEnd   > 0 ? nav.loadEventEnd   : null,
+                    tti:  nav.domInteractive > 0 ? nav.domInteractive : null
+                }},
+                net: {{
+                    dns:  dns,  tcp: tcp, tls: tls, ttfb: ttfb, download: dl,
+                    resource_count:        resources.length,
+                    failed_resource_count: failedCount,
+                    total_transfer_kb:     totalBytes / 1024,
+                    slowest_ms:  slowestMs  > 0    ? slowestMs  : null,
+                    slowest_url: slowestUrl !== null ? slowestUrl : null
+                }},
+                lcp: null,
+                cls: null
+            }};
+
+            // ── LCP + CLS via buffered PerformanceObservers ───────────────────────
+            var lcpDone = false, clsDone = false;
+            var clsTotal = 0;
+            var checkDone = function() {{ if (lcpDone && clsDone) done(collected); }};
+
+            try {{
+                new PerformanceObserver(function(list) {{
+                    var e = list.getEntries();
+                    if (e.length) collected.lcp = e[e.length - 1].startTime;
+                    lcpDone = true; checkDone();
+                }}).observe({{ type: 'largest-contentful-paint', buffered: true }});
+            }} catch(_) {{ lcpDone = true; checkDone(); }}
+
+            try {{
+                new PerformanceObserver(function(list) {{
+                    list.getEntries().forEach(function(e) {{
+                        if (!e.hadRecentInput) clsTotal += e.value;
+                    }});
+                    collected.cls = clsTotal > 0 ? clsTotal : null;
+                    clsDone = true; checkDone();
+                }}).observe({{ type: 'layout-shift', buffered: true }});
+            }} catch(_) {{ clsDone = true; checkDone(); }}
+
+            // Safety net: deliver whatever we have after 500ms
+            setTimeout(function() {{ lcpDone = true; clsDone = true; checkDone(); }}, 500);
+
+        }} catch(err) {{
+            done({{ issues:[], links:[], perf:{{}}, net:{{}}, lcp:null, cls:null, _error: err.toString() }});
+        }}
+    }}
+
+    // ── SPA content detection ─────────────────────────────────────────────────
+    // With eager page load strategy, goto returns at DOMContentLoaded before
+    // SPA frameworks (React, Vue, etc.) have had a chance to render. We use a
+    // MutationObserver to detect when real content appears, then collect.
+    function hasContent() {{
+        var b = document.body;
+        if (!b) return false;
+        // Consider the page "ready" once it has either a meaningful amount of
+        // HTML or at least one navigable link.
+        return b.innerHTML.length >= 200 || b.querySelectorAll('a[href]').length > 0;
+    }}
+
+    if (hasContent() || document.readyState === 'complete') {{
+        runCollect();
+    }} else {{
+        var mo = new MutationObserver(function() {{
+            if (hasContent()) {{
+                mo.disconnect();
+                runCollect();
+            }}
+        }});
+        mo.observe(document.body || document.documentElement, {{ childList: true, subtree: true }});
+        // Fallback: collect after 6s even if content threshold not met
+        setTimeout(function() {{ mo.disconnect(); runCollect(); }}, 6000);
     }}
 }})()
 "#,
@@ -797,7 +834,7 @@ async fn perform_login(
         None => anyhow::bail!("No login URL provided"),
     };
 
-    tokio::time::timeout(Duration::from_secs(12), client.goto(&login_url))
+    tokio::time::timeout(Duration::from_secs(15), client.goto(&login_url))
         .await
         .context("goto login page timed out")??;
     wait_for_dom_ready(client, Duration::from_secs(8)).await;
