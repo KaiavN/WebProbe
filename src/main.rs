@@ -8,38 +8,42 @@ use anyhow::Result;
 use chrono::Local;
 use clap::{Parser, Subcommand};
 use console::style;
+use profiles::{AuthProfile, ProfileStore};
 use std::io::{self, Write};
 use std::path::PathBuf;
-use profiles::{AuthProfile, ProfileStore};
 use types::{AuthConfig, Report};
 
-/// webprobe — Exhaustive web crawler & load tester for localhost development
+/// webprobe — Exhaustive web crawler & load tester for localhost SPAs
 ///
 /// QUICK START
 ///   webprobe crawl 3000
-///   webprobe crawl localhost:3000 --depth 10 --users 20
+///   webprobe crawl localhost:3000 --depth 10 --users 20 --no-load
 ///
-/// LOGIN / AUTH
-///   Minimal usage — prompts for credentials at the terminal (safest):
+/// AUTHENTICATION
+///   Prompt for credentials interactively (safest — nothing in shell history):
 ///     webprobe crawl 3000 --auth-url /login
 ///
-///   Or export env vars so you don't repeat them:
+///   Or export as env vars:
 ///     export WEBPROBE_USERNAME=admin@example.com
 ///     export WEBPROBE_PASSWORD=secret
 ///     webprobe crawl 3000 --auth-url /login
 ///
-///   Inline flags (avoid special characters like ! without single-quoting):
+///   Or pass inline (use single-quotes around passwords with special characters):
 ///     webprobe crawl 3000 --auth-url /login \
-///       --auth-username admin@example.com \
-///       --auth-password 'My!Password'
+///       --auth-username admin@example.com --auth-password 'My!Pass'
 ///
-///   CSS selectors for the login form fields (required):
+///   CSS selectors are auto-detected for most apps. Override if needed:
 ///     --auth-username-selector "#email"
 ///     --auth-password-selector "#password"
 ///     --auth-submit-selector   "button[type='submit']"
 ///
-///   Alternatively inject a cookie file exported from browser DevTools:
+///   Or inject cookies exported from browser DevTools:
 ///     webprobe crawl 3000 --cookies cookies.json
+///
+/// SAVED PROFILES
+///   Save credentials once and reuse across runs:
+///     webprobe profile add
+///     webprobe crawl 3000     ← prompted to load a profile
 #[derive(Parser)]
 #[command(name = "webprobe", version, about)]
 struct Cli {
@@ -51,28 +55,28 @@ struct Cli {
 enum Commands {
     /// Crawl every route, audit for issues, then run a load test
     ///
-    /// LOGIN
-    ///   CSS selectors for the login form fields are required:
-    ///   Minimal usage — prompts for credentials at the terminal (safest):
+    /// AUTHENTICATION
+    ///   Auto-fills login forms using native browser input events (React-compatible).
+    ///   CSS selectors are auto-detected for most apps. Override only if needed.
+    ///
+    ///   Interactive (safest — nothing stored in shell history):
     ///     webprobe crawl 3000 --auth-url /login
     ///
-    ///   Or pass inline (use single quotes around passwords with special chars):
+    ///   Inline flags:
     ///     webprobe crawl 3000 --auth-url /login \
     ///       --auth-username you@example.com --auth-password 'My!Pass'
     ///
-    ///   CSS selectors for the login form fields (required):
-    ///     --auth-username-selector "#email"
-    ///     --auth-password-selector "#password"
-    ///     --auth-submit-selector   "button.login-btn"
-    ///
-    ///   Cookie-based auth (export from DevTools → Application → Cookies):
+    ///   Inject cookies from browser DevTools (Application → Cookies):
     ///     webprobe crawl 3000 --cookies cookies.json
+    ///
+    ///   Use a saved profile:
+    ///     webprobe crawl 3000 --profile myapp
     Crawl {
         /// Target: port number (3000), host:port (localhost:3000), or full URL
         url: String,
 
-        /// Maximum link-follow depth
-        #[arg(short, long, default_value_t = 5)]
+        /// Maximum BFS link-follow depth (default covers most SPAs)
+        #[arg(short, long, default_value_t = 10)]
         depth: usize,
 
         /// Path to write the JSON report (default: report-YYYYMMDD-HHMMSS.json)
@@ -122,17 +126,20 @@ enum Commands {
         auth_password: Option<String>,
 
         /// CSS selector for the username/email input.
-        /// Required when using form-based auth (--auth-url).
+        /// Optional — auto-detected from input type, name, id, placeholder and aria-label.
+        /// Provide only if auto-detection picks the wrong field.
         #[arg(long, value_name = "SELECTOR")]
         auth_username_selector: Option<String>,
 
         /// CSS selector for the password input.
-        /// Required when using form-based auth (--auth-url).
+        /// Optional — auto-detected from input type='password'.
+        /// Provide only if auto-detection picks the wrong field.
         #[arg(long, value_name = "SELECTOR")]
         auth_password_selector: Option<String>,
 
-        /// CSS selector for the submit/sign-in button.
-        /// Required when using form-based auth (--auth-url).
+        /// CSS selector for the submit / sign-in button.
+        /// Optional — auto-detected from button type, text, or aria-label.
+        /// Provide only if auto-detection clicks the wrong element.
         #[arg(long, value_name = "SELECTOR")]
         auth_submit_selector: Option<String>,
 
@@ -328,27 +335,51 @@ async fn main() -> Result<()> {
             if let Some(profile_name) = &profile {
                 let store = ProfileStore::load()?;
                 if let Some(p) = store.get(profile_name) {
-                    if auth_url.is_none() { auth_url = p.login_url.clone(); }
-                    if auth_username.is_none() { auth_username = p.username.clone(); }
-                    if auth_password.is_none() { auth_password = p.password.clone(); }
-                    if auth_username_selector.is_none() { auth_username_selector = p.username_selector.clone(); }
-                    if auth_password_selector.is_none() { auth_password_selector = p.password_selector.clone(); }
-                    if auth_submit_selector.is_none() { auth_submit_selector = p.submit_selector.clone(); }
+                    if auth_url.is_none() {
+                        auth_url = p.login_url.clone();
+                    }
+                    if auth_username.is_none() {
+                        auth_username = p.username.clone();
+                    }
+                    if auth_password.is_none() {
+                        auth_password = p.password.clone();
+                    }
+                    if auth_username_selector.is_none() {
+                        auth_username_selector = p.username_selector.clone();
+                    }
+                    if auth_password_selector.is_none() {
+                        auth_password_selector = p.password_selector.clone();
+                    }
+                    if auth_submit_selector.is_none() {
+                        auth_submit_selector = p.submit_selector.clone();
+                    }
                     profile_used = true;
                     loaded_profile_name = Some(p.name.clone());
-                    println!("  {}  Using profile: {}", style("→").cyan(), style(profile_name).bold());
+                    println!(
+                        "  {}  Using profile: {}",
+                        style("→").cyan(),
+                        style(profile_name).bold()
+                    );
                 } else {
-                    println!("  {}  Profile {:?} not found — continuing without it.", style("⚠").yellow(), profile_name);
+                    println!(
+                        "  {}  Profile {:?} not found — continuing without it.",
+                        style("⚠").yellow(),
+                        profile_name
+                    );
                 }
             }
 
-            let mut auth_username = auth_username
-                .or_else(|| std::env::var("WEBPROBE_USERNAME").ok());
-            let mut auth_password = auth_password
-                .or_else(|| std::env::var("WEBPROBE_PASSWORD").ok());
+            let mut auth_username =
+                auth_username.or_else(|| std::env::var("WEBPROBE_USERNAME").ok());
+            let mut auth_password =
+                auth_password.or_else(|| std::env::var("WEBPROBE_PASSWORD").ok());
 
             // Only ask about auth if nothing was provided via flags/env.
-            if auth_url.is_none() && auth_username.is_none() && auth_password.is_none() && cookies.is_none() {
+            if auth_url.is_none()
+                && auth_username.is_none()
+                && auth_password.is_none()
+                && cookies.is_none()
+            {
                 println!();
                 println!(
                     "  {}  {}",
@@ -360,7 +391,11 @@ async fn main() -> Result<()> {
                 if !store_for_load.is_empty() {
                     let profiles_list = store_for_load.list();
                     println!();
-                    println!("  {}  {}", style("◆").cyan().bold(), style("Saved profiles").bold());
+                    println!(
+                        "  {}  {}",
+                        style("◆").cyan().bold(),
+                        style("Saved profiles").bold()
+                    );
                     for (i, p) in profiles_list.iter().enumerate() {
                         println!(
                             "  {}  {}  {}  {}",
@@ -389,9 +424,12 @@ async fn main() -> Result<()> {
                             auth_url = auth_url.or_else(|| p.login_url.clone());
                             auth_username = auth_username.or_else(|| p.username.clone());
                             auth_password = auth_password.or_else(|| p.password.clone());
-                            auth_username_selector = auth_username_selector.or_else(|| p.username_selector.clone());
-                            auth_password_selector = auth_password_selector.or_else(|| p.password_selector.clone());
-                            auth_submit_selector = auth_submit_selector.or_else(|| p.submit_selector.clone());
+                            auth_username_selector =
+                                auth_username_selector.or_else(|| p.username_selector.clone());
+                            auth_password_selector =
+                                auth_password_selector.or_else(|| p.password_selector.clone());
+                            auth_submit_selector =
+                                auth_submit_selector.or_else(|| p.submit_selector.clone());
                             profile_used = true;
                             loaded_profile_name = Some(p.name.clone());
                             println!(
@@ -406,147 +444,151 @@ async fn main() -> Result<()> {
                 // Only ask login questions if a profile didn't already fill everything in.
                 let profile_loaded = auth_url.is_some();
                 if !profile_loaded {
-                print!(
-                    "  {}  {} ",
-                    style("└").cyan().dim(),
-                    style("Does this site require login? [y/N]:").dim()
-                );
-                io::stdout().flush().ok();
-                let mut input = String::new();
-                io::stdin().read_line(&mut input).ok();
-
-                if input.trim().eq_ignore_ascii_case("y") {
-                    println!();
-                    println!(
-                        "  {}  {}",
-                        style("◆").cyan().bold(),
-                        style("Login details").bold()
+                    print!(
+                        "  {}  {} ",
+                        style("└").cyan().dim(),
+                        style("Does this site require login? [y/N]:").dim()
                     );
+                    io::stdout().flush().ok();
+                    let mut input = String::new();
+                    io::stdin().read_line(&mut input).ok();
 
-                    // Login URL (required)
-                    loop {
-                        print!(
-                            "  {}  {} ",
-                            style("├").cyan().dim(),
-                            style("Login page path or full URL (e.g. /login):").dim()
+                    if input.trim().eq_ignore_ascii_case("y") {
+                        println!();
+                        println!(
+                            "  {}  {}",
+                            style("◆").cyan().bold(),
+                            style("Login details").bold()
                         );
-                        io::stdout().flush().ok();
-                        let mut url_input = String::new();
-                        io::stdin().read_line(&mut url_input).ok();
-                        let trimmed = url_input.trim().to_string();
-                        if !trimmed.is_empty() {
-                            auth_url = Some(trimmed);
-                            break;
-                        }
-                        eprintln!("  {}  Login URL is required.", style("⚠").yellow());
-                    }
 
-                    // Username (required)
-                    if auth_username.is_none() {
+                        // Login URL (required)
                         loop {
                             print!(
                                 "  {}  {} ",
                                 style("├").cyan().dim(),
-                                style("Username / email:").dim()
+                                style("Login page path or full URL (e.g. /login):").dim()
                             );
                             io::stdout().flush().ok();
-                            let mut u_input = String::new();
-                            io::stdin().read_line(&mut u_input).ok();
-                            let trimmed = u_input.trim().to_string();
+                            let mut url_input = String::new();
+                            io::stdin().read_line(&mut url_input).ok();
+                            let trimmed = url_input.trim().to_string();
                             if !trimmed.is_empty() {
-                                auth_username = Some(trimmed);
+                                auth_url = Some(trimmed);
                                 break;
                             }
-                            eprintln!("  {}  Username is required.", style("⚠").yellow());
+                            eprintln!("  {}  Login URL is required.", style("⚠").yellow());
                         }
-                    }
 
-                    // Password (required)
-                    if auth_password.is_none() {
-                        loop {
-                            let pwd = rpassword::prompt_password(format!(
+                        // Username (required)
+                        if auth_username.is_none() {
+                            loop {
+                                print!(
+                                    "  {}  {} ",
+                                    style("├").cyan().dim(),
+                                    style("Username / email:").dim()
+                                );
+                                io::stdout().flush().ok();
+                                let mut u_input = String::new();
+                                io::stdin().read_line(&mut u_input).ok();
+                                let trimmed = u_input.trim().to_string();
+                                if !trimmed.is_empty() {
+                                    auth_username = Some(trimmed);
+                                    break;
+                                }
+                                eprintln!("  {}  Username is required.", style("⚠").yellow());
+                            }
+                        }
+
+                        // Password (required)
+                        if auth_password.is_none() {
+                            loop {
+                                let pwd = rpassword::prompt_password(format!(
+                                    "  {}  {} ",
+                                    style("├").cyan().dim(),
+                                    style("Password:").dim()
+                                ))
+                                .unwrap_or_default();
+                                if !pwd.is_empty() {
+                                    auth_password = Some(pwd);
+                                    break;
+                                }
+                                eprintln!("  {}  Password is required.", style("⚠").yellow());
+                            }
+                        }
+
+                        // CSS selector prompts (required when auth is enabled)
+                        println!();
+                        println!(
+                            "  {}  {}",
+                            style("◆").cyan().bold(),
+                            style("Form selectors").bold()
+                        );
+                        println!(
+                            "  {}  {}",
+                            style("│").cyan().dim(),
+                            style("How to find a selector:  open DevTools (F12) → right-click")
+                                .dim()
+                        );
+                        println!(
+                            "  {}  {}",
+                            style("│").cyan().dim(),
+                            style("the element → Inspect → right-click the node in the HTML").dim()
+                        );
+                        println!(
+                            "  {}  {}",
+                            style("│").cyan().dim(),
+                            style("panel → Copy → Copy selector.").dim()
+                        );
+                        println!();
+
+                        if auth_username_selector.is_none() {
+                            print!(
                                 "  {}  {} ",
                                 style("├").cyan().dim(),
-                                style("Password:").dim()
-                            ))
-                            .unwrap_or_default();
-                            if !pwd.is_empty() {
-                                auth_password = Some(pwd);
-                                break;
+                                style("Username field selector (optional, Enter to auto-detect):")
+                                    .dim()
+                            );
+                            io::stdout().flush().ok();
+                            let mut s = String::new();
+                            io::stdin().read_line(&mut s).ok();
+                            let trimmed = s.trim().to_string();
+                            if !trimmed.is_empty() {
+                                auth_username_selector = Some(trimmed);
                             }
-                            eprintln!("  {}  Password is required.", style("⚠").yellow());
+                        }
+
+                        if auth_password_selector.is_none() {
+                            print!(
+                                "  {}  {} ",
+                                style("├").cyan().dim(),
+                                style("Password field selector (optional, Enter to auto-detect):")
+                                    .dim()
+                            );
+                            io::stdout().flush().ok();
+                            let mut s = String::new();
+                            io::stdin().read_line(&mut s).ok();
+                            let trimmed = s.trim().to_string();
+                            if !trimmed.is_empty() {
+                                auth_password_selector = Some(trimmed);
+                            }
+                        }
+
+                        if auth_submit_selector.is_none() {
+                            print!(
+                                "  {}  {} ",
+                                style("└").cyan().dim(),
+                                style("Submit button selector (optional, Enter to auto-detect):")
+                                    .dim()
+                            );
+                            io::stdout().flush().ok();
+                            let mut s = String::new();
+                            io::stdin().read_line(&mut s).ok();
+                            let trimmed = s.trim().to_string();
+                            if !trimmed.is_empty() {
+                                auth_submit_selector = Some(trimmed);
+                            }
                         }
                     }
-
-                    // CSS selector prompts (required when auth is enabled)
-                    println!();
-                    println!(
-                        "  {}  {}",
-                        style("◆").cyan().bold(),
-                        style("Form selectors").bold()
-                    );
-                    println!(
-                        "  {}  {}",
-                        style("│").cyan().dim(),
-                        style("How to find a selector:  open DevTools (F12) → right-click").dim()
-                    );
-                    println!(
-                        "  {}  {}",
-                        style("│").cyan().dim(),
-                        style("the element → Inspect → right-click the node in the HTML").dim()
-                    );
-                    println!(
-                        "  {}  {}",
-                        style("│").cyan().dim(),
-                        style("panel → Copy → Copy selector.").dim()
-                    );
-                    println!();
-
-                    if auth_username_selector.is_none() {
-                        print!(
-                            "  {}  {} ",
-                            style("├").cyan().dim(),
-                            style("Username field selector (optional, Enter to auto-detect):").dim()
-                        );
-                        io::stdout().flush().ok();
-                        let mut s = String::new();
-                        io::stdin().read_line(&mut s).ok();
-                        let trimmed = s.trim().to_string();
-                        if !trimmed.is_empty() {
-                            auth_username_selector = Some(trimmed);
-                        }
-                    }
-
-                    if auth_password_selector.is_none() {
-                        print!(
-                            "  {}  {} ",
-                            style("├").cyan().dim(),
-                            style("Password field selector (optional, Enter to auto-detect):").dim()
-                        );
-                        io::stdout().flush().ok();
-                        let mut s = String::new();
-                        io::stdin().read_line(&mut s).ok();
-                        let trimmed = s.trim().to_string();
-                        if !trimmed.is_empty() {
-                            auth_password_selector = Some(trimmed);
-                        }
-                    }
-
-                    if auth_submit_selector.is_none() {
-                        print!(
-                            "  {}  {} ",
-                            style("└").cyan().dim(),
-                            style("Submit button selector (optional, Enter to auto-detect):").dim()
-                        );
-                        io::stdout().flush().ok();
-                        let mut s = String::new();
-                        io::stdin().read_line(&mut s).ok();
-                        let trimmed = s.trim().to_string();
-                        if !trimmed.is_empty() {
-                            auth_submit_selector = Some(trimmed);
-                        }
-                    }
-                }
                 } // end if !profile_loaded
             }
 
@@ -691,9 +733,15 @@ async fn main() -> Result<()> {
                             login_url: auth_url.clone().or(existing.login_url),
                             username: auth_username.clone().or(existing.username),
                             password: auth_password.clone().or(existing.password),
-                            username_selector: auth_username_selector.clone().or(existing.username_selector),
-                            password_selector: auth_password_selector.clone().or(existing.password_selector),
-                            submit_selector: auth_submit_selector.clone().or(existing.submit_selector),
+                            username_selector: auth_username_selector
+                                .clone()
+                                .or(existing.username_selector),
+                            password_selector: auth_password_selector
+                                .clone()
+                                .or(existing.password_selector),
+                            submit_selector: auth_submit_selector
+                                .clone()
+                                .or(existing.submit_selector),
                         };
                         let changed = updated.login_url != orig_login_url
                             || updated.username_selector != orig_user_sel
@@ -753,10 +801,18 @@ async fn main() -> Result<()> {
                                         style("✓").green(),
                                         name
                                     ),
-                                    Err(e) => eprintln!("  {}  Could not save profile: {}", style("⚠").yellow(), e),
+                                    Err(e) => eprintln!(
+                                        "  {}  Could not save profile: {}",
+                                        style("⚠").yellow(),
+                                        e
+                                    ),
                                 }
                             }
-                            Err(e) => eprintln!("  {}  Could not load profiles: {}", style("⚠").yellow(), e),
+                            Err(e) => eprintln!(
+                                "  {}  Could not load profiles: {}",
+                                style("⚠").yellow(),
+                                e
+                            ),
                         }
                     }
                 }
@@ -772,11 +828,7 @@ async fn main() -> Result<()> {
                 );
             }
             if let Some(sel) = &selector {
-                println!(
-                    "  {}  Link scope: {}",
-                    style("→").cyan(),
-                    style(sel).bold()
-                );
+                println!("  {}  Link scope: {}", style("→").cyan(), style(sel).bold());
             }
 
             println!(
@@ -813,12 +865,20 @@ async fn main() -> Result<()> {
             report.perf_metrics = crawl_result.perf_metrics;
             report.network_stats = crawl_result.network_stats;
             report.crawl_stats = crawl_result.stats;
+            let discovered = {
+                let mut urls = crawl_result.discovered_urls;
+                urls.sort();
+                urls.dedup();
+                urls
+            };
+            report.discovered_urls = discovered.clone();
+            report.interactions = crawl_result.interactions;
 
             if !no_load && users > 0 {
-                let load_urls = if crawl_result.discovered_urls.is_empty() {
+                let load_urls = if discovered.is_empty() {
                     vec![url.clone()]
                 } else {
-                    crawl_result.discovered_urls.clone()
+                    discovered
                 };
                 let url_msg = if load_urls.len() > 1 {
                     format!("{} URLs, ", load_urls.len())
@@ -911,7 +971,11 @@ async fn main() -> Result<()> {
                             if let Some(u) = &p.username {
                                 println!("  {}    username:  {}", style("│").cyan().dim(), u);
                             }
-                            let pwd_status = if p.password.is_some() { "(saved)" } else { "(none)" };
+                            let pwd_status = if p.password.is_some() {
+                                "(saved)"
+                            } else {
+                                "(none)"
+                            };
                             println!("  {}    password:  {}", style("│").cyan().dim(), pwd_status);
                             if let Some(s) = &p.username_selector {
                                 println!("  {}    user sel:  {}", style("│").cyan().dim(), s);
@@ -929,16 +993,16 @@ async fn main() -> Result<()> {
                     }
                 }
                 ProfileAction::Add => {
-                    print!(
-                        "\n  {}  Profile name: ",
-                        style("◆").cyan().bold()
-                    );
+                    print!("\n  {}  Profile name: ", style("◆").cyan().bold());
                     io::stdout().flush().ok();
                     let mut profile_name = String::new();
                     io::BufRead::read_line(&mut io::stdin().lock(), &mut profile_name).ok();
                     let profile_name = profile_name.trim().to_string();
                     if profile_name.is_empty() {
-                        println!("\n  {} Profile name cannot be empty.\n", style("⚠").yellow());
+                        println!(
+                            "\n  {} Profile name cannot be empty.\n",
+                            style("⚠").yellow()
+                        );
                     } else {
                         let mut store = ProfileStore::load()?;
                         if store.get(&profile_name).is_some() {
@@ -970,13 +1034,14 @@ async fn main() -> Result<()> {
                             );
                             std::io::Write::flush(&mut std::io::stdout()).ok();
                             let mut buf = String::new();
-                            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buf).ok();
+                            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buf)
+                                .ok();
                             let v = buf.trim().to_string();
                             if v.is_empty() { None } else { Some(v) }
                         }
 
-                        let login_url         = prompt_new("Login URL         ");
-                        let username          = prompt_new("Username          ");
+                        let login_url = prompt_new("Login URL         ");
+                        let username = prompt_new("Username          ");
 
                         print!(
                             "  {}  {}: ",
@@ -985,11 +1050,15 @@ async fn main() -> Result<()> {
                         );
                         io::stdout().flush().ok();
                         let pwd_input = rpassword::read_password().unwrap_or_default();
-                        let password = if pwd_input.is_empty() { None } else { Some(pwd_input) };
+                        let password = if pwd_input.is_empty() {
+                            None
+                        } else {
+                            Some(pwd_input)
+                        };
 
                         let username_selector = prompt_new("Username selector ");
                         let password_selector = prompt_new("Password selector ");
-                        let submit_selector   = prompt_new("Submit selector   ");
+                        let submit_selector = prompt_new("Submit selector   ");
 
                         let new_profile = AuthProfile {
                             name: profile_name.clone(),
@@ -1022,7 +1091,9 @@ async fn main() -> Result<()> {
                     let mut store = ProfileStore::load()?;
                     let existing = store.get(&name).cloned();
                     match existing {
-                        None => println!("\n  {} No profile named {:?}.\n", style("⚠").yellow(), name),
+                        None => {
+                            println!("\n  {} No profile named {:?}.\n", style("⚠").yellow(), name)
+                        }
                         Some(p) => {
                             println!(
                                 "\n  {}  Editing profile: {}\n",
@@ -1036,7 +1107,10 @@ async fn main() -> Result<()> {
                             );
                             println!();
 
-                            fn prompt_optional(label: &str, current: &Option<String>) -> Option<String> {
+                            fn prompt_optional(
+                                label: &str,
+                                current: &Option<String>,
+                            ) -> Option<String> {
                                 let cur = current.as_deref().unwrap_or("(none)");
                                 print!(
                                     "  {}  {} [{}]: ",
@@ -1046,20 +1120,32 @@ async fn main() -> Result<()> {
                                 );
                                 std::io::Write::flush(&mut std::io::stdout()).ok();
                                 let mut buf = String::new();
-                                std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buf).ok();
+                                std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buf)
+                                    .ok();
                                 let v = buf.trim().to_string();
-                                if v.is_empty() { current.clone() } else if v == "-" { None } else { Some(v) }
+                                if v.is_empty() {
+                                    current.clone()
+                                } else if v == "-" {
+                                    None
+                                } else {
+                                    Some(v)
+                                }
                             }
 
                             let login_url = prompt_optional("Login URL         ", &p.login_url);
-                            let username   = prompt_optional("Username          ", &p.username);
+                            let username = prompt_optional("Username          ", &p.username);
 
                             // Password — hidden input
                             print!(
                                 "  {}  {} [{}]: ",
                                 style("├").cyan().dim(),
                                 style("Password          ").dim(),
-                                style(if p.password.is_some() { "(saved)" } else { "(none)" }).yellow()
+                                style(if p.password.is_some() {
+                                    "(saved)"
+                                } else {
+                                    "(none)"
+                                })
+                                .yellow()
                             );
                             io::stdout().flush().ok();
                             let new_pwd = rpassword::read_password().unwrap_or_default();
@@ -1071,9 +1157,12 @@ async fn main() -> Result<()> {
                                 Some(new_pwd)
                             };
 
-                            let username_selector = prompt_optional("Username selector ", &p.username_selector);
-                            let password_selector = prompt_optional("Password selector ", &p.password_selector);
-                            let submit_selector   = prompt_optional("Submit selector   ", &p.submit_selector);
+                            let username_selector =
+                                prompt_optional("Username selector ", &p.username_selector);
+                            let password_selector =
+                                prompt_optional("Password selector ", &p.password_selector);
+                            let submit_selector =
+                                prompt_optional("Submit selector   ", &p.submit_selector);
 
                             let updated = AuthProfile {
                                 name: p.name.clone(),

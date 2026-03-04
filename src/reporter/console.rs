@@ -14,9 +14,19 @@ pub fn print_report(report: &Report) {
     );
     println!("  Target : {}", style(&report.target_url).underlined());
     println!(
-        "  Crawled: {} pages  |  {} states  |  {:.1}s",
+        "  Crawled: {} page{}  |  {} interactive element{}  |  {:.1}s",
         report.crawl_stats.pages_visited,
-        report.crawl_stats.states_explored,
+        if report.crawl_stats.pages_visited == 1 {
+            ""
+        } else {
+            "s"
+        },
+        report.crawl_stats.elements_interacted,
+        if report.crawl_stats.elements_interacted == 1 {
+            ""
+        } else {
+            "s"
+        },
         report.crawl_stats.duration_secs
     );
     println!(
@@ -110,6 +120,76 @@ pub fn print_report(report: &Report) {
         }
     }
 
+    // ── Per-page interactive elements ──────────────────────────────────────
+    if !report.interactions.is_empty() {
+        println!(
+            "\n{}",
+            style("  ── Interactive Elements ─────────────────────────────────").dim()
+        );
+        for pi in &report.interactions {
+            println!(
+                "  {}  →  {} element{}",
+                style(&pi.page_url).dim(),
+                pi.elements_found,
+                if pi.elements_found == 1 { "" } else { "s" }
+            );
+            let mut links = 0usize;
+            let mut buttons = 0usize;
+            let mut inputs = 0usize;
+            let mut selects = 0usize;
+            let mut textareas = 0usize;
+            for el in &pi.elements {
+                match el.kind.as_str() {
+                    "link" => links += 1,
+                    "button" => buttons += 1,
+                    "input" => inputs += 1,
+                    "select" => selects += 1,
+                    "textarea" => textareas += 1,
+                    _ => {}
+                }
+            }
+            let mut parts = Vec::new();
+            if links > 0 {
+                parts.push(format!(
+                    "{} link{}",
+                    links,
+                    if links == 1 { "" } else { "s" }
+                ));
+            }
+            if buttons > 0 {
+                parts.push(format!(
+                    "{} button{}",
+                    buttons,
+                    if buttons == 1 { "" } else { "s" }
+                ));
+            }
+            if inputs > 0 {
+                parts.push(format!(
+                    "{} input{}",
+                    inputs,
+                    if inputs == 1 { "" } else { "s" }
+                ));
+            }
+            if selects > 0 {
+                parts.push(format!(
+                    "{} select{}",
+                    selects,
+                    if selects == 1 { "" } else { "s" }
+                ));
+            }
+            if textareas > 0 {
+                parts.push(format!(
+                    "{} textarea{}",
+                    textareas,
+                    if textareas == 1 { "" } else { "s" }
+                ));
+            }
+            if !parts.is_empty() {
+                println!("      {}", style(parts.join("  ·  ")).dim());
+            }
+        }
+    }
+
     // ── Performance ────────────────────────────────────────────────────────
     if !report.perf_metrics.is_empty() {
         println!(
@@ -142,10 +222,6 @@ pub fn print_report(report: &Report) {
                 let s = perf_color(cls, 0.1, 0.25);
                 println!("    CLS:  {}", s(format!("{:.3}", cls)));
             }
-            if let Some(tbt) = p.tbt_ms {
-                let s = perf_color(tbt, 200.0, 600.0);
-                println!("    TBT:  {}ms", s(format!("{:.0}", tbt)));
-            }
             if let Some(load) = p.load_ms {
                 let s = perf_color(load, 2000.0, 4000.0);
                 println!("    Load: {}ms", s(format!("{:.0}", load)));
@@ -165,20 +241,22 @@ pub fn print_report(report: &Report) {
         for n in &report.network_stats {
             println!("  {}", style(&n.page_url).dim());
             if let Some(dns) = n.dns_ms {
-                println!("    DNS:      {:.1}ms", dns);
+                if dns > 0.1 { println!("    DNS:      {:.1}ms", dns); }
             }
             if let Some(tcp) = n.tcp_connect_ms {
-                println!("    TCP:      {:.1}ms", tcp);
+                if tcp > 0.1 { println!("    TCP:      {:.1}ms", tcp); }
             }
             if let Some(tls) = n.tls_ms {
-                println!("    TLS:      {:.1}ms", tls);
+                if tls > 0.1 { println!("    TLS:      {:.1}ms", tls); }
             }
             if let Some(ttfb) = n.ttfb_ms {
-                let s = perf_color(ttfb, 200.0, 600.0);
-                println!("    TTFB:     {}ms", s(format!("{:.1}", ttfb)));
+                if ttfb > 0.1 {
+                    let s = perf_color(ttfb, 200.0, 600.0);
+                    println!("    TTFB:     {}ms", s(format!("{:.1}", ttfb)));
+                }
             }
             if let Some(dl) = n.download_ms {
-                println!("    Download: {:.1}ms", dl);
+                if dl > 0.1 { println!("    Download: {:.1}ms", dl); }
             }
             println!(
                 "    Resources: {}  failed: {}  transferred: {:.1}KB",
@@ -187,7 +265,8 @@ pub fn print_report(report: &Report) {
             if let (Some(ms), Some(url)) = (n.slowest_resource_ms, &n.slowest_resource_url) {
                 let short_url_owned;
                 let short_url = if url.len() > 60 {
-                    let start = url.char_indices()
+                    let start = url
+                        .char_indices()
                         .rev()
                         .nth(59)
                         .map(|(i, _)| i)
@@ -197,7 +276,8 @@ pub fn print_report(report: &Report) {
                 } else {
                     url.as_str()
                 };
-                println!("    Slowest:   {:.0}ms  …{}", ms, style(short_url).dim());
+                let ms_str = if ms > 500.0 { style(format!("{:.0}ms", ms)).red() } else if ms > 200.0 { style(format!("{:.0}ms", ms)).yellow() } else { style(format!("{:.0}ms", ms)).dim() };
+                println!("    Slowest:   {}  …{}", ms_str, style(short_url).dim().italic());
             }
         }
     }
@@ -221,8 +301,24 @@ pub fn print_report(report: &Report) {
         );
         println!(
             "  Latency  mean:{:.0}ms  p50:{:.0}ms  p90:{:.0}ms  p95:{:.0}ms  p99:{:.0}ms  max:{:.0}ms",
-            lt.latency_mean_ms, lt.latency_p50_ms, lt.latency_p90_ms, lt.latency_p95_ms, lt.latency_p99_ms, lt.latency_max_ms
+            lt.latency_mean_ms,
+            lt.latency_p50_ms,
+            lt.latency_p90_ms,
+            lt.latency_p95_ms,
+            lt.latency_p99_ms,
+            lt.latency_max_ms
         );
+    }
+
+    // ── Discovered URLs ────────────────────────────────────────────────────
+    if !report.discovered_urls.is_empty() {
+        println!(
+            "\n{}",
+            style("  ── Discovered URLs ───────────────────────────────────────").dim()
+        );
+        for url in &report.discovered_urls {
+            println!("    {}", style(url).dim());
+        }
     }
 
     // ── Summary ────────────────────────────────────────────────────────────

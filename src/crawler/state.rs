@@ -20,6 +20,4 @@ impl StateTracker {
     pub fn visit(&self, fingerprint: &str) -> bool {
         self.visited.insert(fingerprint.to_string())
     }
-
-
 }

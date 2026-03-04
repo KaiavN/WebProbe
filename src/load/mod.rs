@@ -3,8 +3,8 @@ use anyhow::Result;
 use hdrhistogram::Histogram;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub struct LoadConfig {
@@ -55,7 +55,8 @@ pub async fn run_load_test(config: LoadConfig) -> Result<LoadTestResult> {
         let start_offset = worker_id as usize;
 
         handles.push(tokio::spawn(async move {
-            let mut local_hist: Histogram<u64> = Histogram::new(3).expect("failed to create histogram");
+            let mut local_hist: Histogram<u64> =
+                Histogram::new(3).expect("failed to create histogram");
             let mut req_count: usize = start_offset;
             while Instant::now() < deadline {
                 let url = &urls[req_count % urls.len()];
@@ -133,7 +134,11 @@ pub async fn run_load_test(config: LoadConfig) -> Result<LoadTestResult> {
     let failed = failed_requests.load(Ordering::Relaxed);
     let successful = total - failed;
 
-    let mean = if merged.len() > 0 { merged.mean() / 1000.0 } else { 0.0 };
+    let mean = if merged.len() > 0 {
+        merged.mean() / 1000.0
+    } else {
+        0.0
+    };
     let min = merged.min() as f64 / 1000.0;
     let max = merged.max() as f64 / 1000.0;
     let p50 = merged.value_at_percentile(50.0) as f64 / 1000.0;

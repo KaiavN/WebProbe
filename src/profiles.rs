@@ -45,8 +45,8 @@ impl ProfileStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create directory {}", parent.display()))?;
         }
-        let contents = serde_json::to_string_pretty(&self.data)
-            .context("Failed to serialize profiles")?;
+        let contents =
+            serde_json::to_string_pretty(&self.data).context("Failed to serialize profiles")?;
         std::fs::write(&self.file_path, contents)
             .with_context(|| format!("Failed to write {}", self.file_path.display()))?;
         Ok(())

@@ -3,8 +3,8 @@ pub mod element;
 pub mod state;
 
 use crate::types::{
-    AuthConfig, CookieEntry, CrawlStats, Issue, IssueCategory, NetworkStats, PageState,
-    PerfMetrics, Severity,
+    AuthConfig, CookieEntry, CrawlStats, InteractiveElement, Issue, IssueCategory, NetworkStats,
+    PageInteractions, PageState, PerfMetrics, Severity,
 };
 use anyhow::{Context, Result};
 use async_channel;
@@ -41,6 +41,7 @@ pub struct CrawlResult {
     pub network_stats: Vec<NetworkStats>,
     pub stats: CrawlStats,
     pub discovered_urls: Vec<String>,
+    pub interactions: Vec<PageInteractions>,
 }
 
 /// Open a browser session — capabilities differ between Firefox, Chrome, and Safari.
@@ -50,10 +51,7 @@ async fn new_session(driver_url: &str, headless: bool, kind: DriverKind) -> Resu
     // "eager" page load strategy: goto returns on DOMContentLoaded instead of waiting
     // for every asset (images, fonts, Vite HMR modules, etc.) to finish loading.
     // DOM auditing and buffered PerformanceObservers still capture everything we need.
-    caps.insert(
-        "pageLoadStrategy".to_string(),
-        serde_json::json!("eager"),
-    );
+    caps.insert("pageLoadStrategy".to_string(), serde_json::json!("eager"));
 
     match kind {
         DriverKind::Gecko => {
@@ -83,10 +81,7 @@ async fn new_session(driver_url: &str, headless: bool, kind: DriverKind) -> Resu
         }
         DriverKind::Safari => {
             // safaridriver uses browserName capability; no headless support.
-            caps.insert(
-                "browserName".to_string(),
-                serde_json::json!("safari"),
-            );
+            caps.insert("browserName".to_string(), serde_json::json!("safari"));
         }
     }
     ClientBuilder::native()
@@ -166,39 +161,68 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
         sessions.push(s);
     }
 
+    let all_issues: Arc<Mutex<Vec<Issue>>> = Arc::new(Mutex::new(Vec::new()));
+    let all_perf: Arc<Mutex<Vec<PerfMetrics>>> = Arc::new(Mutex::new(Vec::new()));
+    let all_network: Arc<Mutex<Vec<NetworkStats>>> = Arc::new(Mutex::new(Vec::new()));
+    let all_discovered: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let all_crawled: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let all_interactions: Arc<Mutex<Vec<PageInteractions>>> = Arc::new(Mutex::new(Vec::new()));
+    let pages_visited = Arc::new(AtomicUsize::new(0));
+    let issue_count = Arc::new(AtomicUsize::new(0));
+
     // ── Auth ─────────────────────────────────────────────────────────────────
     if let Some(cookies_file) = &config.auth.cookies_file {
         // Inject file cookies into ALL sessions so each worker is authenticated.
         for (idx, sess) in sessions.iter().enumerate() {
             match inject_cookies(sess, &config.start_url, cookies_file).await {
-                Ok(()) => { if idx == 0 { println!("  {} Cookies injected", style("✓").green()); } }
-                Err(e) => { if idx == 0 { eprintln!("  {} Cookie injection failed: {}", style("⚠").yellow(), e); } }
+                Ok(()) => {
+                    if idx == 0 {
+                        println!("  {} Cookies injected", style("✓").green());
+                    }
+                }
+                Err(e) => {
+                    if idx == 0 {
+                        eprintln!("  {} Cookie injection failed: {}", style("⚠").yellow(), e);
+                    }
+                }
             }
         }
     }
 
     // URL the browser lands on after login (may differ from start_url).
     let mut post_login_url: Option<String> = None;
+    let mut login_discovered_links = Vec::new();
+    let mut login_url_for_stats = String::new();
 
     if config.auth.login_url.is_some() {
         print!("  {} Authenticating… ", style("→").cyan());
         use std::io::Write;
         std::io::stdout().flush().ok();
-        match perform_login(&sessions[0], &config.auth, &config.start_url, config.settle_ms).await
+        match perform_login(
+            &sessions[0],
+            &config.auth,
+            &config.start_url,
+            config.settle_ms,
+            true,
+            config.link_selector.as_deref(),
+        )
+        .await
         {
-            Ok(()) => {
+            Ok((issues, perf, net, links, page_interactions)) => {
                 println!("{}", style("ok").green().bold());
                 // Record the post-login URL so we can seed it into the BFS below.
                 // After a successful login the browser is usually on the dashboard/home
                 // page, which may be a different route than start_url.
                 if let Ok(landed) = sessions[0].current_url().await {
                     let landed_str = landed.to_string();
+                    login_url_for_stats = landed_str.clone(); // The URL we are auditing
                     let norm_landed = landed_str.trim_end_matches('/');
-                    let norm_start  = config.start_url.trim_end_matches('/');
+                    let norm_start = config.start_url.trim_end_matches('/');
                     if norm_landed != norm_start {
                         post_login_url = Some(landed_str);
                     }
                 }
+                login_discovered_links = links;
                 // Replicate auth cookies from sessions[0] to all other sessions so that
                 // every concurrent worker crawls as the authenticated user.
                 if sessions.len() > 1 {
@@ -213,12 +237,33 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
                         }
                     }
                 }
+
+                // Add the login page data to global crawler stats
+                if let Ok(mut g) = all_issues.lock() {
+                    g.extend(issues);
+                }
+                if let Ok(mut g) = all_perf.lock() {
+                    g.push(perf);
+                }
+                if let Ok(mut g) = all_network.lock() {
+                    g.push(net);
+                }
+                if let Ok(mut g) = all_interactions.lock() {
+                    g.push(page_interactions);
+                }
+                // Use the initial login_url (or current url) for crawled stats
+                if let Ok(mut g) = all_crawled.lock() {
+                    g.push(login_url_for_stats.clone());
+                }
             }
             Err(e) => {
                 println!("{}", style("failed").red().bold());
                 eprintln!("  {} Login failed: {}", style("⚠").red().bold(), e);
                 eprintln!("  {} The crawl has been aborted.", style("│").red().dim());
-                eprintln!("  {} Check that your credentials and selectors are correct.", style("│").red().dim());
+                eprintln!(
+                    "  {} Check that your credentials and selectors are correct.",
+                    style("│").red().dim()
+                );
                 anyhow::bail!("Login failed");
             }
         }
@@ -246,14 +291,34 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
             tx.send(post_state).await.ok();
         }
     }
+    // Also add any links discovered on the login page itself
+    if let Ok(auth_u) = Url::parse(&login_url_for_stats) {
+        let login_state = PageState::new(&login_url_for_stats);
+        for link in login_discovered_links {
+            if !config.skip_paths.is_empty() {
+                if let Ok(u) = Url::parse(&link) {
+                    let path = u.path();
+                    if config
+                        .skip_paths
+                        .iter()
+                        .any(|s| path == s.as_str() || path.starts_with(&format!("{}/", s)))
+                    {
+                        continue;
+                    }
+                }
+            }
+            let child = login_state.child(&link, "link");
+            let fp = child.fingerprint();
+            if tracker.visit(&fp) {
+                initial_pending += 1;
+                tx.send(child).await.ok();
+            }
+            if let Ok(mut g) = all_discovered.lock() {
+                g.push(link);
+            }
+        }
+    }
     let pending = Arc::new(AtomicUsize::new(initial_pending));
-
-    let all_issues: Arc<Mutex<Vec<Issue>>> = Arc::new(Mutex::new(Vec::new()));
-    let all_perf: Arc<Mutex<Vec<PerfMetrics>>> = Arc::new(Mutex::new(Vec::new()));
-    let all_network: Arc<Mutex<Vec<NetworkStats>>> = Arc::new(Mutex::new(Vec::new()));
-    let all_discovered: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let pages_visited = Arc::new(AtomicUsize::new(0));
-    let issue_count = Arc::new(AtomicUsize::new(0));
 
     let pb = ProgressBar::new_spinner();
     pb.set_style(
@@ -276,6 +341,8 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
         let all_perf = Arc::clone(&all_perf);
         let all_network = Arc::clone(&all_network);
         let all_discovered = Arc::clone(&all_discovered);
+        let all_crawled = Arc::clone(&all_crawled);
+        let all_interactions = Arc::clone(&all_interactions);
         let pages_visited = Arc::clone(&pages_visited);
         let issue_count = Arc::clone(&issue_count);
         let base_host = base_host.clone();
@@ -303,7 +370,7 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
                 .await;
 
                 match result {
-                    Ok(Ok((issues, perf, net, links))) => {
+                    Ok(Ok((issues, perf, net, links, page_interactions))) => {
                         let n_issues = issues.len();
                         let mut new_states = vec![];
                         for link in links {
@@ -312,8 +379,7 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
                                 if let Ok(u) = Url::parse(&link) {
                                     let path = u.path();
                                     if skip_paths.iter().any(|s| {
-                                        path == s.as_str()
-                                            || path.starts_with(&format!("{}/", s))
+                                        path == s.as_str() || path.starts_with(&format!("{}/", s))
                                     }) {
                                         continue;
                                     }
@@ -326,10 +392,28 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
                                 new_states.push(child);
                             }
                         }
-                        if let Ok(mut g) = all_issues.lock() { g.extend(issues); }
-                        if let Ok(mut g) = all_perf.lock() { g.push(perf); }
-                        if let Ok(mut g) = all_network.lock() { g.push(net); }
-                        if let Ok(mut g) = all_discovered.lock() { g.push(state.url.clone()); }
+                        if let Ok(mut g) = all_issues.lock() {
+                            g.extend(issues);
+                        }
+                        if let Ok(mut g) = all_perf.lock() {
+                            g.push(perf);
+                        }
+                        if let Ok(mut g) = all_network.lock() {
+                            g.push(net);
+                        }
+                        // crawled = pages audited; discovered = all links found across all pages
+                        if let Ok(mut g) = all_crawled.lock() {
+                            g.push(state.url.clone());
+                        }
+                        // store per-page interactive elements
+                        if let Ok(mut g) = all_interactions.lock() {
+                            g.push(page_interactions);
+                        }
+                        for link in &new_states {
+                            if let Ok(mut g) = all_discovered.lock() {
+                                g.push(link.url.clone());
+                            }
+                        }
                         let visited = pages_visited.fetch_add(1, Ordering::Relaxed) + 1;
                         issue_count.fetch_add(n_issues, Ordering::Relaxed);
                         pb.set_position(visited as u64);
@@ -339,12 +423,7 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
                         }
                     }
                     Ok(Err(e)) => {
-                        pb.println(format!(
-                            "  {} {} — {}",
-                            style("⚠").yellow(),
-                            state.url,
-                            e
-                        ));
+                        pb.println(format!("  {} {} — {}", style("⚠").yellow(), state.url, e));
                     }
                     Err(_) => {
                         pb.println(format!(
@@ -374,16 +453,45 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
     drop(driver);
 
     let pages_visited = pages_visited.load(Ordering::Relaxed);
-    let all_issues = Arc::try_unwrap(all_issues).expect("worker tasks still holding Arc").into_inner().unwrap_or_default();
-    let all_perf = Arc::try_unwrap(all_perf).expect("worker tasks still holding Arc").into_inner().unwrap_or_default();
-    let all_network = Arc::try_unwrap(all_network).expect("worker tasks still holding Arc").into_inner().unwrap_or_default();
-    let all_discovered = Arc::try_unwrap(all_discovered).expect("worker tasks still holding Arc").into_inner().unwrap_or_default();
+    let all_issues = Arc::try_unwrap(all_issues)
+        .expect("worker tasks still holding Arc")
+        .into_inner()
+        .unwrap_or_default();
+    let all_perf = Arc::try_unwrap(all_perf)
+        .expect("worker tasks still holding Arc")
+        .into_inner()
+        .unwrap_or_default();
+    let all_network = Arc::try_unwrap(all_network)
+        .expect("worker tasks still holding Arc")
+        .into_inner()
+        .unwrap_or_default();
+    let mut all_crawled = Arc::try_unwrap(all_crawled)
+        .expect("worker tasks still holding Arc")
+        .into_inner()
+        .unwrap_or_default();
+    all_crawled.sort();
+    let mut all_discovered_links = Arc::try_unwrap(all_discovered)
+        .expect("worker tasks still holding Arc")
+        .into_inner()
+        .unwrap_or_default();
+    let mut all_interactions = Arc::try_unwrap(all_interactions)
+        .expect("worker tasks still holding Arc")
+        .into_inner()
+        .unwrap_or_default();
+    all_interactions.sort_by(|a, b| a.page_url.cmp(&b.page_url));
+    let total_elements: usize = all_interactions.iter().map(|p| p.elements_found).sum();
+    // Merge crawled URLs into discovered so the set is a true superset
+    all_discovered_links.extend(all_crawled.clone());
+    all_discovered_links.sort();
+    all_discovered_links.dedup();
 
     println!(
-        "  {} Crawled {} page{}  ({} issue{})",
+        "  {} Crawled {} page{}  │  {} interactive element{}  │  {} issue{}",
         style("✓").green().bold(),
         pages_visited,
         if pages_visited == 1 { "" } else { "s" },
+        total_elements,
+        if total_elements == 1 { "" } else { "s" },
         all_issues.len(),
         if all_issues.len() == 1 { "" } else { "s" }
     );
@@ -394,11 +502,12 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
         network_stats: all_network,
         stats: CrawlStats {
             pages_visited,
-            elements_interacted: 0,
-            states_explored: pages_visited,
             duration_secs: start.elapsed().as_secs_f64(),
+            elements_interacted: total_elements,
+            crawled_urls: all_crawled,
         },
-        discovered_urls: all_discovered,
+        discovered_urls: all_discovered_links,
+        interactions: all_interactions,
     })
 }
 
@@ -414,7 +523,13 @@ async fn audit_page(
     settle_ms: u64,
     discover: bool,
     link_selector: Option<&str>,
-) -> Result<(Vec<Issue>, PerfMetrics, NetworkStats, Vec<String>)> {
+) -> Result<(
+    Vec<Issue>,
+    PerfMetrics,
+    NetworkStats,
+    Vec<String>,
+    PageInteractions,
+)> {
     // Navigate (ignore "soft" errors that still land on the page)
     let goto = tokio::time::timeout(Duration::from_secs(15), client.goto(url)).await;
     match goto {
@@ -433,6 +548,43 @@ async fn audit_page(
 
     wait_for_dom_ready(client, Duration::from_secs(5)).await;
 
+    // Inject error listeners immediately after DOM ready, before the settle
+    // delay, so we capture any errors that fire during JS hydration.
+    let _ = client
+        .execute(
+            r#"
+        if (!window.__webprobe_init) {
+            window.__webprobe_init = true;
+            window.__webprobe_errors = window.__webprobe_errors || [];
+            window.addEventListener('error', function(e) {
+                var msg = e.message || String(e);
+                if (e.filename) msg += ' @ ' + e.filename + ':' + e.lineno;
+                window.__webprobe_errors.push(msg);
+            }, { capture: true, passive: true });
+            window.addEventListener('unhandledrejection', function(e) {
+                try {
+                    var r = e.reason;
+                    var msg = (r && r.message) ? r.message : String(r);
+                    window.__webprobe_errors.push('UnhandledRejection: ' + msg);
+                } catch(_) {}
+            }, { capture: true, passive: true });
+            /* Intercept console.error too */
+            var _origErr = console.error.bind(console);
+            console.error = function() {
+                try {
+                    var parts = Array.prototype.slice.call(arguments).map(function(a) {
+                        return (typeof a === 'object') ? JSON.stringify(a) : String(a);
+                    });
+                    window.__webprobe_errors.push('console.error: ' + parts.join(' '));
+                } catch(_) {}
+                _origErr.apply(console, arguments);
+            };
+        }
+        "#,
+            vec![],
+        )
+        .await;
+
     if settle_ms > 0 {
         tokio::time::sleep(Duration::from_millis(settle_ms)).await;
     }
@@ -440,9 +592,13 @@ async fn audit_page(
     // Build and execute the async collection script
     let js = build_collect_js(base_host, discover, link_selector);
 
-    const EMPTY_RESULT: &str = r#"{"issues":[],"links":[],"perf":{},"net":{},"lcp":null,"cls":null}"#;
+    const EMPTY_RESULT: &str =
+        r#"{"issues":[],"links":[],"perf":{},"net":{},"lcp":null,"cls":null}"#;
     let raw = match client.execute_async(&js, vec![]).await {
-        Ok(v) => v.as_str().map(|s| s.to_string()).unwrap_or_else(|| EMPTY_RESULT.to_string()),
+        Ok(v) => v
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| EMPTY_RESULT.to_string()),
         Err(e) => {
             eprintln!("  ⚠  JS collection failed on {}: {}", url, e);
             EMPTY_RESULT.to_string()
@@ -496,7 +652,6 @@ async fn audit_page(
         lcp_ms: v["lcp"].as_f64(),
         tti_ms: p["tti"].as_f64(),
         cls_score: v["cls"].as_f64(),
-        tbt_ms: None,
         dom_content_loaded_ms: p["dcl"].as_f64(),
         load_ms: load,
     };
@@ -504,37 +659,107 @@ async fn audit_page(
     // Flag performance anomalies
     if let Some(fcp) = perf.fcp_ms {
         if fcp >= 3000.0 {
-            page_issues.push(Issue { severity: Severity::Error, category: IssueCategory::Performance, message: format!("FCP is very slow: {:.0}ms (error > 3s)", fcp), page_url: url.to_string(), element: None, action_path: vec![] });
+            page_issues.push(Issue {
+                severity: Severity::Error,
+                category: IssueCategory::Performance,
+                message: format!("FCP is very slow: {:.0}ms (error > 3s)", fcp),
+                page_url: url.to_string(),
+                element: None,
+                action_path: vec![],
+            });
         } else if fcp >= 1800.0 {
-            page_issues.push(Issue { severity: Severity::Warning, category: IssueCategory::Performance, message: format!("FCP is slow: {:.0}ms (warn > 1.8s)", fcp), page_url: url.to_string(), element: None, action_path: vec![] });
+            page_issues.push(Issue {
+                severity: Severity::Warning,
+                category: IssueCategory::Performance,
+                message: format!("FCP is slow: {:.0}ms (warn > 1.8s)", fcp),
+                page_url: url.to_string(),
+                element: None,
+                action_path: vec![],
+            });
         }
     }
     if let Some(lcp) = perf.lcp_ms {
         if lcp >= 4000.0 {
-            page_issues.push(Issue { severity: Severity::Error, category: IssueCategory::Performance, message: format!("LCP is very slow: {:.0}ms (error > 4s)", lcp), page_url: url.to_string(), element: None, action_path: vec![] });
+            page_issues.push(Issue {
+                severity: Severity::Error,
+                category: IssueCategory::Performance,
+                message: format!("LCP is very slow: {:.0}ms (error > 4s)", lcp),
+                page_url: url.to_string(),
+                element: None,
+                action_path: vec![],
+            });
         } else if lcp >= 2500.0 {
-            page_issues.push(Issue { severity: Severity::Warning, category: IssueCategory::Performance, message: format!("LCP is slow: {:.0}ms (warn > 2.5s)", lcp), page_url: url.to_string(), element: None, action_path: vec![] });
+            page_issues.push(Issue {
+                severity: Severity::Warning,
+                category: IssueCategory::Performance,
+                message: format!("LCP is slow: {:.0}ms (warn > 2.5s)", lcp),
+                page_url: url.to_string(),
+                element: None,
+                action_path: vec![],
+            });
         }
     }
     if let Some(tti) = perf.tti_ms {
         if tti >= 7300.0 {
-            page_issues.push(Issue { severity: Severity::Error, category: IssueCategory::Performance, message: format!("TTI is very slow: {:.0}ms (error > 7.3s)", tti), page_url: url.to_string(), element: None, action_path: vec![] });
+            page_issues.push(Issue {
+                severity: Severity::Error,
+                category: IssueCategory::Performance,
+                message: format!("TTI is very slow: {:.0}ms (error > 7.3s)", tti),
+                page_url: url.to_string(),
+                element: None,
+                action_path: vec![],
+            });
         } else if tti >= 3800.0 {
-            page_issues.push(Issue { severity: Severity::Warning, category: IssueCategory::Performance, message: format!("TTI is slow: {:.0}ms (warn > 3.8s)", tti), page_url: url.to_string(), element: None, action_path: vec![] });
+            page_issues.push(Issue {
+                severity: Severity::Warning,
+                category: IssueCategory::Performance,
+                message: format!("TTI is slow: {:.0}ms (warn > 3.8s)", tti),
+                page_url: url.to_string(),
+                element: None,
+                action_path: vec![],
+            });
         }
     }
     if let Some(cls) = perf.cls_score {
         if cls >= 0.25 {
-            page_issues.push(Issue { severity: Severity::Error, category: IssueCategory::Performance, message: format!("CLS is extremely high: {:.3} (error > 0.25)", cls), page_url: url.to_string(), element: None, action_path: vec![] });
+            page_issues.push(Issue {
+                severity: Severity::Error,
+                category: IssueCategory::Performance,
+                message: format!("CLS is extremely high: {:.3} (error > 0.25)", cls),
+                page_url: url.to_string(),
+                element: None,
+                action_path: vec![],
+            });
         } else if cls >= 0.1 {
-            page_issues.push(Issue { severity: Severity::Warning, category: IssueCategory::Performance, message: format!("CLS is high: {:.3} (warn > 0.1)", cls), page_url: url.to_string(), element: None, action_path: vec![] });
+            page_issues.push(Issue {
+                severity: Severity::Warning,
+                category: IssueCategory::Performance,
+                message: format!("CLS is high: {:.3} (warn > 0.1)", cls),
+                page_url: url.to_string(),
+                element: None,
+                action_path: vec![],
+            });
         }
     }
     if let Some(ld) = perf.load_ms {
         if ld >= 4000.0 {
-            page_issues.push(Issue { severity: Severity::Error, category: IssueCategory::Performance, message: format!("Page load is very slow: {:.0}ms (error > 4s)", ld), page_url: url.to_string(), element: None, action_path: vec![] });
+            page_issues.push(Issue {
+                severity: Severity::Error,
+                category: IssueCategory::Performance,
+                message: format!("Page load is very slow: {:.0}ms (error > 4s)", ld),
+                page_url: url.to_string(),
+                element: None,
+                action_path: vec![],
+            });
         } else if ld >= 2000.0 {
-            page_issues.push(Issue { severity: Severity::Warning, category: IssueCategory::Performance, message: format!("Page load is slow: {:.0}ms (warn > 2s)", ld), page_url: url.to_string(), element: None, action_path: vec![] });
+            page_issues.push(Issue {
+                severity: Severity::Warning,
+                category: IssueCategory::Performance,
+                message: format!("Page load is slow: {:.0}ms (warn > 2s)", ld),
+                page_url: url.to_string(),
+                element: None,
+                action_path: vec![],
+            });
         }
     }
 
@@ -551,7 +776,11 @@ async fn audit_page(
         failed_resource_count: n["failed_resource_count"].as_u64().unwrap_or(0) as usize,
         failed_resource_urls: n["failed_resource_urls"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default(),
         total_transfer_kb: n["total_transfer_kb"].as_f64().unwrap_or(0.0),
         slowest_resource_ms: n["slowest_ms"].as_f64(),
@@ -561,9 +790,23 @@ async fn audit_page(
     // Flag network anomalies
     if let Some(ttfb) = net.ttfb_ms {
         if ttfb >= 600.0 {
-            page_issues.push(Issue { severity: Severity::Error, category: IssueCategory::NetworkError, message: format!("TTFB is very slow: {:.0}ms (error > 600ms)", ttfb), page_url: url.to_string(), element: None, action_path: vec![] });
+            page_issues.push(Issue {
+                severity: Severity::Error,
+                category: IssueCategory::NetworkError,
+                message: format!("TTFB is very slow: {:.0}ms (error > 600ms)", ttfb),
+                page_url: url.to_string(),
+                element: None,
+                action_path: vec![],
+            });
         } else if ttfb >= 200.0 {
-            page_issues.push(Issue { severity: Severity::Warning, category: IssueCategory::NetworkError, message: format!("TTFB is slow: {:.0}ms (warn > 200ms)", ttfb), page_url: url.to_string(), element: None, action_path: vec![] });
+            page_issues.push(Issue {
+                severity: Severity::Warning,
+                category: IssueCategory::NetworkError,
+                message: format!("TTFB is slow: {:.0}ms (warn > 200ms)", ttfb),
+                page_url: url.to_string(),
+                element: None,
+                action_path: vec![],
+            });
         }
     }
     if net.failed_resource_count > 0 {
@@ -578,7 +821,11 @@ async fn audit_page(
             message: format!(
                 "{} resource{} failed to load{}",
                 net.failed_resource_count,
-                if net.failed_resource_count == 1 { "" } else { "s" },
+                if net.failed_resource_count == 1 {
+                    ""
+                } else {
+                    "s"
+                },
                 detail
             ),
             page_url: url.to_string(),
@@ -587,7 +834,35 @@ async fn audit_page(
         });
     }
 
-    Ok((page_issues, perf, net, links))
+    // ── Interactive elements ──────────────────────────────────────────────────
+    let mut elements: Vec<InteractiveElement> = Vec::new();
+    if let Some(arr) = v["interactive"].as_array() {
+        for item in arr {
+            let kind = item["kind"].as_str().unwrap_or("unknown").to_string();
+            let label = item["label"]
+                .as_str()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let href = item["href"]
+                .as_str()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty() && !s.starts_with("javascript"));
+            let input_type = item["input_type"].as_str().map(|s| s.to_string());
+            elements.push(InteractiveElement {
+                kind,
+                label,
+                href,
+                input_type,
+            });
+        }
+    }
+    let page_interactions = PageInteractions {
+        page_url: url.to_string(),
+        elements_found: elements.len(),
+        elements,
+    };
+
+    Ok((page_issues, perf, net, links, page_interactions))
 }
 
 /// Build the async JS collection script for a given page.
@@ -621,17 +896,21 @@ fn build_collect_js(base_host: &str, discover: bool, link_selector: Option<&str>
     function runCollect() {{
         clearTimeout(safetyTimer);
         try {{
-            // ── Accessibility & SEO issues ────────────────────────────────────────
+            // ── Runtime JS errors (captured by the pre-injected listener) ──────────
             var issues = [];
+            var runtimeErrors = window.__webprobe_errors || [];
+            for (var rei = 0; rei < runtimeErrors.length; rei++) {{
+                issues.push({{ sev:'error', cat:'console_error', msg: runtimeErrors[rei] }});
+            }}
 
+            // ── Accessibility issues ───────────────────────────────────────────────
             document.querySelectorAll('img:not([alt])').forEach(function(el) {{
                 issues.push({{ sev:'warning', cat:'accessibility',
                     msg:'Image missing alt attribute', el:el.outerHTML.slice(0,120) }});
             }});
 
             document.querySelectorAll(
-                'input:not([type="hidden"]):not([type="submit"]):not([type="button"])' +
-                ':not([type="reset"]):not([type="image"]):not([aria-label]):not([aria-labelledby])'
+                'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]):not([type="image"]):not([aria-label]):not([aria-labelledby])'
             ).forEach(function(el) {{
                 if (!el.id || !document.querySelector('label[for="' + el.id + '"]')) {{
                     issues.push({{ sev:'warning', cat:'accessibility',
@@ -653,9 +932,25 @@ fn build_collect_js(base_host: &str, discover: bool, link_selector: Option<&str>
                 }}
             }});
 
+            // Images without explicit width/height — causes layout shifts (CLS)
+            document.querySelectorAll('img').forEach(function(el) {{
+                if (!el.getAttribute('width') || !el.getAttribute('height')) {{
+                    issues.push({{ sev:'info', cat:'accessibility',
+                        msg:'Image missing width/height attributes (may cause layout shift)',
+                        el: el.outerHTML.slice(0,120) }});
+                }}
+            }});
+
+            // ── SEO / Security issues ─────────────────────────────────────────────
             var titleEl = document.querySelector('title');
             if (!titleEl || !titleEl.textContent.trim()) {{
                 issues.push({{ sev:'warning', cat:'seo', msg:'Page is missing a <title> element' }});
+            }} else {{
+                var titleLen = titleEl.textContent.trim().length;
+                if (titleLen > 60) {{
+                    issues.push({{ sev:'info', cat:'seo',
+                        msg:'<title> is ' + titleLen + ' characters (recommended max: 60)' }});
+                }}
             }}
             if (!document.documentElement.getAttribute('lang')) {{
                 issues.push({{ sev:'warning', cat:'accessibility',
@@ -669,7 +964,72 @@ fn build_collect_js(base_host: &str, discover: bool, link_selector: Option<&str>
                 issues.push({{ sev:'info', cat:'seo', msg:'Missing <meta name="description">' }});
             }}
 
-            // ── Link discovery ────────────────────────────────────────────────────
+            // Duplicate <h1> — bad for SEO
+            var h1Count = document.querySelectorAll('h1').length;
+            if (h1Count > 1) {{
+                issues.push({{ sev:'warning', cat:'seo',
+                    msg: h1Count + ' <h1> elements found on this page (should be exactly one)' }});
+            }}
+
+            // <a target="_blank"> without rel="noopener" — security risk
+            document.querySelectorAll('a[target="_blank"]').forEach(function(el) {{
+                var rel = (el.getAttribute('rel') || '').toLowerCase();
+                if (rel.indexOf('noopener') < 0) {{
+                    issues.push({{ sev:'warning', cat:'seo',
+                        msg:'External link opens in new tab without rel="noopener noreferrer"',
+                        el: el.outerHTML.slice(0,120) }});
+                }}
+            }});
+
+            // ── Interactive element discovery ─────────────────────────────────────
+            var interactive = [];
+
+            // Links (all <a href> on the page, including cross-origin for completeness)
+            document.querySelectorAll('a[href]').forEach(function(el) {{
+                var label = (el.textContent || '').trim()
+                    || el.getAttribute('aria-label')
+                    || el.getAttribute('title')
+                    || null;
+                interactive.push({{ kind:'link', label: label || null, href: el.href || null }});
+            }});
+
+            // Buttons — <button>, role="button", input[submit/button/reset]
+            document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"], input[type="reset"]').forEach(function(el) {{
+                var label = (el.textContent || '').trim()
+                    || el.getAttribute('aria-label')
+                    || el.getAttribute('value')
+                    || el.getAttribute('title')
+                    || null;
+                interactive.push({{ kind:'button', label: label || null }});
+            }});
+
+            // Text-like inputs
+            document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"])').forEach(function(el) {{
+                var label = el.getAttribute('aria-label')
+                    || el.getAttribute('placeholder')
+                    || el.getAttribute('name')
+                    || null;
+                interactive.push({{ kind:'input', label: label || null, input_type: el.type || 'text' }});
+            }});
+
+            // Select dropdowns
+            document.querySelectorAll('select').forEach(function(el) {{
+                var label = el.getAttribute('aria-label')
+                    || el.getAttribute('name')
+                    || null;
+                interactive.push({{ kind:'select', label: label || null }});
+            }});
+
+            // Textareas
+            document.querySelectorAll('textarea').forEach(function(el) {{
+                var label = el.getAttribute('aria-label')
+                    || el.getAttribute('placeholder')
+                    || el.getAttribute('name')
+                    || null;
+                interactive.push({{ kind:'textarea', label: label || null }});
+            }});
+
+            // ── Link discovery (for BFS) ──────────────────────────────────────────
             var links = [];
             if ({discover}) {{
                 var seen = new Set();
@@ -703,21 +1063,37 @@ fn build_collect_js(base_host: &str, discover: bool, link_selector: Option<&str>
             var dl   = (nav.responseEnd      != null && nav.responseStart     != null)
                        ? nav.responseEnd     - nav.responseStart      : null;
 
+            // Tightened heuristic: a resource truly failed if:
+            //   - transferSize is 0 AND decodedBodySize is 0 (not cached, not prefetch)
+            //   - duration is suspiciously short (< 5ms — genuine failures resolve instantly)
+            //   - not a data URI or blob URI (those are always "0-byte" by design)
+            //   - responseStatus (Chrome 109+) is 4xx/5xx when available
             var resources = performance.getEntriesByType('resource');
             var totalBytes = 0, failedCount = 0, failedUrls = [], slowestMs = 0, slowestUrl = null;
             for (var i = 0; i < resources.length; i++) {{
                 var r = resources[i];
                 if (r.transferSize) totalBytes += r.transferSize;
-                if (r.duration < 1 && r.transferSize === 0 && r.decodedBodySize === 0) {{
-                    failedCount++;
-                    failedUrls.push(r.name);
+                var name = r.name || '';
+                var isDataOrBlob = name.startsWith('data:') || name.startsWith('blob:');
+                var likelyFailed = !isDataOrBlob
+                    && r.transferSize === 0
+                    && r.decodedBodySize === 0
+                    && r.duration < 5;
+                // If responseStatus is available (Chrome 109+) use it as ground truth
+                if (r.responseStatus && r.responseStatus >= 400) {{
+                    likelyFailed = true;
                 }}
-                if (r.duration > slowestMs) {{ slowestMs = r.duration; slowestUrl = r.name; }}
+                if (likelyFailed) {{
+                    failedCount++;
+                    failedUrls.push(name);
+                }}
+                if (r.duration > slowestMs) {{ slowestMs = r.duration; slowestUrl = name; }}
             }}
 
             var collected = {{
                 issues: issues,
                 links:  links,
+                interactive: interactive,
                 perf: {{
                     fcp:  paint['first-contentful-paint'] || null,
                     dcl:  nav.domContentLoadedEventEnd > 0 ? nav.domContentLoadedEventEnd : null,
@@ -796,7 +1172,8 @@ fn build_collect_js(base_host: &str, discover: bool, link_selector: Option<&str>
 }})(arguments[arguments.length - 1]);
 "#,
         discover = if discover { "true" } else { "false" },
-        base_host_json = serde_json::to_string(base_host).unwrap_or_else(|_| format!("\"{}\"", base_host)),
+        base_host_json =
+            serde_json::to_string(base_host).unwrap_or_else(|_| format!("\"{}\"", base_host)),
         anchor_query = anchor_query,
     )
 }
@@ -841,8 +1218,7 @@ async fn inject_cookies(
 
     let mut failed = 0usize;
     for e in &entries {
-        let mut cookie =
-            fantoccini::cookies::Cookie::new(e.name.clone(), e.value.clone());
+        let mut cookie = fantoccini::cookies::Cookie::new(e.name.clone(), e.value.clone());
         if let Some(path) = &e.path {
             cookie.set_path(path.clone());
         }
@@ -900,14 +1276,27 @@ async fn perform_login(
     auth: &AuthConfig,
     base_url: &str,
     settle_ms: u64,
-) -> Result<()> {
+    discover: bool,
+    link_selector: Option<&str>,
+) -> Result<(
+    Vec<Issue>,
+    PerfMetrics,
+    NetworkStats,
+    Vec<String>,
+    PageInteractions,
+)> {
     let login_url = match &auth.login_url {
         Some(u) if u.starts_with("http://") || u.starts_with("https://") => u.clone(),
         Some(path) if path.starts_with('/') => {
             // Root-relative path: use only the origin (scheme + host + port), ignore base_url path.
             // e.g. base_url="http://localhost:3000/app", path="/login" → "http://localhost:3000/login"
-            let base = Url::parse(base_url).unwrap_or_else(|_| Url::parse("http://localhost").unwrap());
-            let mut origin = format!("{}://{}", base.scheme(), base.host_str().unwrap_or("localhost"));
+            let base =
+                Url::parse(base_url).unwrap_or_else(|_| Url::parse("http://localhost").unwrap());
+            let mut origin = format!(
+                "{}://{}",
+                base.scheme(),
+                base.host_str().unwrap_or("localhost")
+            );
             if let Some(port) = base.port() {
                 origin.push_str(&format!(":{}", port));
             }
@@ -921,10 +1310,25 @@ async fn perform_login(
         None => anyhow::bail!("No login URL provided"),
     };
 
-    tokio::time::timeout(Duration::from_secs(15), client.goto(&login_url))
-        .await
-        .context("goto login page timed out")??;
-    wait_for_dom_ready(client, Duration::from_secs(8)).await;
+    // Call audit_page on the login view directly. This handles .goto(), waits
+    // for DOM ready, injects the JS collectors, and gathers interactive elements.
+    let base_host = Url::parse(base_url)
+        .unwrap_or_else(|_| Url::parse("http://localhost").unwrap())
+        .host_str()
+        .unwrap_or("localhost")
+        .to_string();
+
+    let page_stats = audit_page(
+        client,
+        &login_url,
+        &base_host,
+        settle_ms,
+        discover,
+        link_selector,
+    )
+    .await?;
+
+    // Now we are actively on the login page; wait for the form input to appear
 
     // Poll until at least one <input> appears — handles SPAs that render the
     // login form asynchronously after the initial DOM ready event.
@@ -945,12 +1349,8 @@ async fn perform_login(
     // Small extra wait for the rest of the form to finish rendering
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let username = auth.username.as_deref()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Login URL is configured but --auth-username was not provided"))?;
-    let password = auth.password.as_deref()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Login URL is configured but --auth-password was not provided"))?;
+    let username = auth.username.as_deref().unwrap_or("");
+    let password = auth.password.as_deref().unwrap_or("");
 
     // ── Username / email field ────────────────────────────────────────────────
     let user_el = if let Some(sel) = auth.username_selector.as_deref() {
@@ -1046,7 +1446,9 @@ async fn perform_login(
                 // 3. Last resort: first visible text input on the page
                 find_first(client, &["input[type='text']"]).await
             }
-            .ok_or_else(|| anyhow::anyhow!("Could not find a username/email field on the login page"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Could not find a username/email field on the login page")
+            })?
         }
     };
     user_el.click().await.ok();
@@ -1055,15 +1457,17 @@ async fn perform_login(
         .send_keys(username)
         .await
         .context("Failed to type into username field")?;
-    
+
     // Dispatch native events to ensure SPA frameworks (React/Vue) detect the change
-    let _ = client.execute(
-        "if (document.activeElement) { \
+    let _ = client
+        .execute(
+            "if (document.activeElement) { \
              document.activeElement.dispatchEvent(new Event('input', { bubbles: true })); \
              document.activeElement.dispatchEvent(new Event('change', { bubbles: true })); \
          }",
-        vec![],
-    ).await;
+            vec![],
+        )
+        .await;
 
     // ── Multi-step login: if password field isn't visible yet, click "Next" ──
     // Use JS visibility check (offsetParent/offsetWidth) rather than WebDriver find(),
@@ -1111,7 +1515,7 @@ async fn perform_login(
         .ok()
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    
+
     if !password_immediately_visible {
         let next_xpath = "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')] | \
             //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next')] | \
@@ -1122,10 +1526,8 @@ async fn perform_login(
         let mut next_btn_opt = client.find(Locator::XPath(next_xpath)).await.ok();
 
         if next_btn_opt.is_none() {
-            next_btn_opt = find_first(client, &[
-                "button[type='submit']",
-                "input[type='submit']",
-            ]).await;
+            next_btn_opt =
+                find_first(client, &["button[type='submit']", "input[type='submit']"]).await;
         }
 
         if next_btn_opt.is_none() {
@@ -1191,23 +1593,30 @@ async fn perform_login(
         .context("Failed to type into password field")?;
 
     // Dispatch native events for password
-    let _ = client.execute(
-        "if (document.activeElement) { \
+    let _ = client
+        .execute(
+            "if (document.activeElement) { \
              document.activeElement.dispatchEvent(new Event('input', { bubbles: true })); \
              document.activeElement.dispatchEvent(new Event('change', { bubbles: true })); \
          }",
-        vec![],
-    ).await;
+            vec![],
+        )
+        .await;
 
     let submit_el_opt = if let Some(sel) = auth.submit_selector.as_deref() {
         client.find(Locator::Css(sel)).await.ok()
     } else {
         // 1. Explicit type=submit or type=image (image submit buttons)
-        if let Some(el) = find_first(client, &[
-            "button[type='submit']",
-            "input[type='submit']",
-            "input[type='image']",
-        ]).await {
+        if let Some(el) = find_first(
+            client,
+            &[
+                "button[type='submit']",
+                "input[type='submit']",
+                "input[type='image']",
+            ],
+        )
+        .await
+        {
             Some(el)
         } else {
             // 2. Button or role=button whose visible text or aria-label contains login keyword
@@ -1216,7 +1625,9 @@ async fn perform_login(
             } else {
                 // 3. Last button inside a <form>, then last button on the page
                 let all = client
-                    .find_all(Locator::Css("form button, form [role='button'], button, [role='button']"))
+                    .find_all(Locator::Css(
+                        "form button, form [role='button'], button, [role='button']",
+                    ))
                     .await
                     .unwrap_or_default();
                 all.into_iter().last()
@@ -1225,10 +1636,16 @@ async fn perform_login(
     };
 
     if let Some(submit_el) = submit_el_opt {
-        submit_el.click().await.context("Failed to click sign-in button")?;
+        submit_el
+            .click()
+            .await
+            .context("Failed to click sign-in button")?;
     } else {
         // No submit button found. Fall back to pressing Enter in the password field.
-        pass_el.send_keys("\u{e007}").await.context("Failed to send Enter key to password field as a fallback submit")?;
+        pass_el
+            .send_keys("\u{e007}")
+            .await
+            .context("Failed to send Enter key to password field as a fallback submit")?;
     }
 
     // Wait up to 10 seconds for the login transition to complete
@@ -1243,21 +1660,27 @@ async fn perform_login(
             let current = current_url.as_str();
             final_url = current.to_string();
 
-            let url_indicates_login_page = Url::parse(current).ok().map(|mut cu| {
-                if let Ok(mut lu) = Url::parse(&login_url) {
-                    cu.set_query(None);
-                    cu.set_fragment(None);
-                    lu.set_query(None);
-                    lu.set_fragment(None);
-                    if cu == lu {
-                        return true;
+            let url_indicates_login_page = Url::parse(current)
+                .ok()
+                .map(|mut cu| {
+                    if let Ok(mut lu) = Url::parse(&login_url) {
+                        cu.set_query(None);
+                        cu.set_fragment(None);
+                        lu.set_query(None);
+                        lu.set_fragment(None);
+                        if cu == lu {
+                            return true;
+                        }
                     }
-                }
-                let path = cu.path().to_lowercase();
-                path.split('/').any(|seg| {
-                    matches!(seg, "login" | "signin" | "sign-in" | "auth" | "authenticate")
+                    let path = cu.path().to_lowercase();
+                    path.split('/').any(|seg| {
+                        matches!(
+                            seg,
+                            "login" | "signin" | "sign-in" | "auth" | "authenticate"
+                        )
+                    })
                 })
-            }).unwrap_or(false);
+                .unwrap_or(false);
 
             let password_visible = client
                 .execute(
@@ -1287,7 +1710,10 @@ async fn perform_login(
 
     // Additionally check if the page body indicates a generic auth failure
     let body_text = client
-        .execute("return document.body ? document.body.innerText.toLowerCase() : '';", vec![])
+        .execute(
+            "return document.body ? document.body.innerText.toLowerCase() : '';",
+            vec![],
+        )
         .await
         .ok()
         .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -1330,5 +1756,5 @@ async fn perform_login(
         anyhow::bail!(msg);
     }
 
-    Ok(())
+    Ok(page_stats)
 }

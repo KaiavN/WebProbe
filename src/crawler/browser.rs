@@ -68,7 +68,10 @@ impl DriverProcess {
 
         // ── Firefox present but no geckodriver — install geckodriver (~2 MB) ──
         if has_firefox && !has_gecko {
-            print!("  {} geckodriver not found — installing… ", style("→").cyan());
+            print!(
+                "  {} geckodriver not found — installing… ",
+                style("→").cyan()
+            );
             if brew_install("geckodriver").await {
                 println!("{}", style("ok").green().bold());
                 println!(
@@ -84,7 +87,10 @@ impl DriverProcess {
 
         // ── Chrome present but no chromedriver — install chromedriver (~5 MB) ─
         if has_chrome && !has_chrome_driver {
-            print!("  {} chromedriver not found — installing… ", style("→").cyan());
+            print!(
+                "  {} chromedriver not found — installing… ",
+                style("→").cyan()
+            );
             if brew_install("chromedriver").await {
                 println!("{}", style("ok").green().bold());
                 println!(
@@ -99,8 +105,8 @@ impl DriverProcess {
         }
 
         // ── No browser installed: fall back to safaridriver, install Chrome bg ─
-        let safari_available = cmd_in_path("safaridriver")
-            || std::path::Path::new("/usr/bin/safaridriver").exists();
+        let safari_available =
+            cmd_in_path("safaridriver") || std::path::Path::new("/usr/bin/safaridriver").exists();
 
         if safari_available {
             let missing = if !has_firefox && !has_chrome {
@@ -142,7 +148,10 @@ impl DriverProcess {
         }
 
         // ── Last resort: try to install Firefox + geckodriver synchronously ───
-        print!("  {} No browser found — installing Firefox… ", style("→").cyan());
+        print!(
+            "  {} No browser found — installing Firefox… ",
+            style("→").cyan()
+        );
         if brew_install_cask("firefox").await {
             println!("{}", style("ok").green().bold());
             print!("  {} Installing geckodriver… ", style("→").cyan());
@@ -213,12 +222,7 @@ impl DriverProcess {
         Self::wait_ready(child, port, DriverKind::Safari, "safaridriver").await
     }
 
-    async fn wait_ready(
-        child: Child,
-        port: u16,
-        kind: DriverKind,
-        name: &str,
-    ) -> Result<Self> {
+    async fn wait_ready(child: Child, port: u16, kind: DriverKind, name: &str) -> Result<Self> {
         let status_url = format!("http://127.0.0.1:{}/status", port);
         let poll_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
@@ -273,14 +277,8 @@ fn firefox_installed() -> bool {
 }
 
 fn chrome_installed() -> bool {
-    std::path::Path::new(
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    )
-    .exists()
-        || std::path::Path::new(
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        )
-        .exists()
+    std::path::Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome").exists()
+        || std::path::Path::new("/Applications/Chromium.app/Contents/MacOS/Chromium").exists()
         || cmd_in_path("google-chrome")
         || cmd_in_path("chromium")
 }

@@ -10,8 +10,8 @@ pub fn write_report(report: &Report, path: &Path) -> Result<()> {
                 .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
         }
     }
-    let json = serde_json::to_string_pretty(report)
-        .context("Failed to serialize report to JSON")?;
+    let json =
+        serde_json::to_string_pretty(report).context("Failed to serialize report to JSON")?;
     std::fs::write(path, json)
         .with_context(|| format!("Failed to write report to {}", path.display()))?;
     Ok(())

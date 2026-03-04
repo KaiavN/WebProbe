@@ -2,6 +2,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// serde skip helper: skip Option<f64> when it's None or Some(0.0)
+pub fn is_zero_f64(v: &Option<f64>) -> bool {
+    match v {
+        None => true,
+        Some(x) => *x == 0.0,
+    }
+}
+
 // ── Auth Config ──────────────────────────────────────────────────────────────
 
 /// Authentication configuration for crawling sites that require login.
@@ -140,13 +148,12 @@ impl PageState {
         let mut sorted_path = self.action_path.clone();
         sorted_path.sort();
         // Normalize URL: strip trailing slash (except root /)
-        let norm_url = if self.url.ends_with('/') && self.url.len() > 1
-            && !self.url.ends_with("://")
-        {
-            self.url.trim_end_matches('/').to_string()
-        } else {
-            self.url.clone()
-        };
+        let norm_url =
+            if self.url.ends_with('/') && self.url.len() > 1 && !self.url.ends_with("://") {
+                self.url.trim_end_matches('/').to_string()
+            } else {
+                self.url.clone()
+            };
         format!("{}|{}", norm_url, sorted_path.join(";"))
     }
 
@@ -167,18 +174,22 @@ impl PageState {
 pub struct PerfMetrics {
     pub page_url: String,
     /// First Contentful Paint (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fcp_ms: Option<f64>,
     /// Largest Contentful Paint (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub lcp_ms: Option<f64>,
     /// Time to Interactive (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tti_ms: Option<f64>,
-    /// Cumulative Layout Shift score
+    /// Cumulative Layout Shift score (null on Firefox / no layout shifts)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cls_score: Option<f64>,
-    /// Total Blocking Time (ms)
-    pub tbt_ms: Option<f64>,
     /// DOM Content Loaded (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dom_content_loaded_ms: Option<f64>,
     /// Load event (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub load_ms: Option<f64>,
 }
 
@@ -209,29 +220,63 @@ pub struct LoadTestResult {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NetworkStats {
     pub page_url: String,
-    /// DNS lookup time for the main document (ms)
+    /// DNS lookup time for the main document (ms) — always 0 on localhost
+    #[serde(skip_serializing_if = "crate::types::is_zero_f64")]
     pub dns_ms: Option<f64>,
-    /// TCP connection setup time (ms)
+    /// TCP connection setup time (ms) — always 0 on localhost
+    #[serde(skip_serializing_if = "crate::types::is_zero_f64")]
     pub tcp_connect_ms: Option<f64>,
-    /// TLS/SSL negotiation time (ms); null for plain HTTP
+    /// TLS/SSL negotiation time (ms) — always null on plain HTTP
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_ms: Option<f64>,
     /// Time To First Byte — time from request start until first byte of response (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ttfb_ms: Option<f64>,
-    /// Response body download time (ms)
+    /// Response body download time (ms) — usually 0 on localhost
+    #[serde(skip_serializing_if = "crate::types::is_zero_f64")]
     pub download_ms: Option<f64>,
     /// Total number of sub-resources loaded (JS, CSS, images, XHR…)
     pub resource_count: usize,
-    /// Number of resources that appear to have failed (0-byte transfer, 0ms duration)
+    /// Number of resources that appear to have failed
     pub failed_resource_count: usize,
     /// URLs of resources that failed to load
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub failed_resource_urls: Vec<String>,
-    /// Estimated total transfer size across all resources (KB); may be 0 for cross-origin resources
+    /// Estimated total transfer size across all resources (KB)
     pub total_transfer_kb: f64,
     /// Duration of the slowest sub-resource (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub slowest_resource_ms: Option<f64>,
     /// URL of the slowest sub-resource
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub slowest_resource_url: Option<String>,
+}
+
+// ── Page Links ──────────────────────────────────────────────────────────────
+
+/// A single interactive element found on a page.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InteractiveElement {
+    /// Element type: "link", "button", "input", "select", "textarea"
+    pub kind: String,
+    /// Visible label, accessible name, or placeholder text
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// href (links only)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub href: Option<String>,
+    /// input type attribute (inputs only, e.g. "text", "checkbox")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_type: Option<String>,
+}
+
+/// All interactive elements found on a single page.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PageInteractions {
+    pub page_url: String,
+    /// Total interactive elements found
+    pub elements_found: usize,
+    pub elements: Vec<InteractiveElement>,
 }
 
 // ── Crawl Stats ──────────────────────────────────────────────────────────────
@@ -239,9 +284,12 @@ pub struct NetworkStats {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CrawlStats {
     pub pages_visited: usize,
-    pub elements_interacted: usize,
-    pub states_explored: usize,
     pub duration_secs: f64,
+    /// Total interactive elements found across all pages
+    pub elements_interacted: usize,
+    /// Every URL that was successfully crawled (audited)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crawled_urls: Vec<String>,
 }
 
 // ── Full Report ──────────────────────────────────────────────────────────────
@@ -256,6 +304,12 @@ pub struct Report {
     pub perf_metrics: Vec<PerfMetrics>,
     pub network_stats: Vec<NetworkStats>,
     pub crawl_stats: CrawlStats,
+    /// All unique internal URLs discovered via link-following (superset of crawled_urls)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovered_urls: Vec<String>,
+    /// Per-page interactive element details
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interactions: Vec<PageInteractions>,
     pub load_test: Option<LoadTestResult>,
     /// Issue counts by severity
     pub summary: ReportSummary,
@@ -281,6 +335,8 @@ impl Report {
             perf_metrics: vec![],
             network_stats: vec![],
             crawl_stats: CrawlStats::default(),
+            discovered_urls: vec![],
+            interactions: vec![],
             load_test: None,
             summary: ReportSummary::default(),
         }
