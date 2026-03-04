@@ -223,6 +223,9 @@ pub struct NetworkStats {
     pub resource_count: usize,
     /// Number of resources that appear to have failed (0-byte transfer, 0ms duration)
     pub failed_resource_count: usize,
+    /// URLs of resources that failed to load
+    #[serde(default)]
+    pub failed_resource_urls: Vec<String>,
     /// Estimated total transfer size across all resources (KB); may be 0 for cross-origin resources
     pub total_transfer_kb: f64,
     /// Duration of the slowest sub-resource (ms)

@@ -177,12 +177,28 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
         }
     }
 
+    // URL the browser lands on after login (may differ from start_url).
+    let mut post_login_url: Option<String> = None;
+
     if config.auth.login_url.is_some() {
         print!("  {} Authenticating… ", style("→").cyan());
+        use std::io::Write;
+        std::io::stdout().flush().ok();
         match perform_login(&sessions[0], &config.auth, &config.start_url, config.settle_ms).await
         {
             Ok(()) => {
                 println!("{}", style("ok").green().bold());
+                // Record the post-login URL so we can seed it into the BFS below.
+                // After a successful login the browser is usually on the dashboard/home
+                // page, which may be a different route than start_url.
+                if let Ok(landed) = sessions[0].current_url().await {
+                    let landed_str = landed.to_string();
+                    let norm_landed = landed_str.trim_end_matches('/');
+                    let norm_start  = config.start_url.trim_end_matches('/');
+                    if norm_landed != norm_start {
+                        post_login_url = Some(landed_str);
+                    }
+                }
                 // Replicate auth cookies from sessions[0] to all other sessions so that
                 // every concurrent worker crawls as the authenticated user.
                 if sessions.len() > 1 {
@@ -201,11 +217,9 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
             Err(e) => {
                 println!("{}", style("failed").red().bold());
                 eprintln!("  {} Login failed: {}", style("⚠").red().bold(), e);
-                eprintln!("  {} The crawl will continue without authentication.", style("│").red().dim());
-                eprintln!("  {} If credentials are correct, try specifying selectors:", style("│").red().dim());
-                eprintln!("  {}   --auth-username-selector \"#email\"", style("│").red().dim());
-                eprintln!("  {}   --auth-password-selector \"#password\"", style("│").red().dim());
-                eprintln!("  {}   --auth-submit-selector   \"button[type='submit']\"", style("│").red().dim());
+                eprintln!("  {} The crawl has been aborted.", style("│").red().dim());
+                eprintln!("  {} Check that your credentials and selectors are correct.", style("│").red().dim());
+                anyhow::bail!("Login failed");
             }
         }
     }
@@ -216,7 +230,23 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
     let first = PageState::new(&config.start_url);
     tracker.visit(&first.fingerprint());
     tx.send(first).await.ok();
-    let pending = Arc::new(AtomicUsize::new(1));
+    let mut initial_pending = 1usize;
+    // Seed the post-login page into the BFS so it gets audited even if start_url
+    // immediately redirects to it (which would mark it visited via the first entry).
+    if let Some(ref post_url) = post_login_url {
+        let post_state = PageState::new(post_url.as_str());
+        let fp = post_state.fingerprint();
+        if tracker.visit(&fp) {
+            println!(
+                "  {} Also crawling post-login page: {}",
+                style("→").cyan(),
+                style(post_url).bold()
+            );
+            initial_pending += 1;
+            tx.send(post_state).await.ok();
+        }
+    }
+    let pending = Arc::new(AtomicUsize::new(initial_pending));
 
     let all_issues: Arc<Mutex<Vec<Issue>>> = Arc::new(Mutex::new(Vec::new()));
     let all_perf: Arc<Mutex<Vec<PerfMetrics>>> = Arc::new(Mutex::new(Vec::new()));
@@ -460,32 +490,53 @@ async fn audit_page(
     // ── Performance ──────────────────────────────────────────────────────────
     let p = &v["perf"];
     let load = p["load"].as_f64();
-    if let Some(l) = load {
-        if l > 3000.0 {
-            page_issues.push(Issue {
-                severity: Severity::Warning,
-                category: IssueCategory::Performance,
-                message: format!("Slow page load: {:.0}ms (threshold 3s)", l),
-                page_url: url.to_string(),
-                element: None,
-                action_path: vec![],
-            });
-        }
-    }
-
     let perf = PerfMetrics {
         page_url: url.to_string(),
         fcp_ms: p["fcp"].as_f64(),
         lcp_ms: v["lcp"].as_f64(),
         tti_ms: p["tti"].as_f64(),
-        // CLS comes from the async observer result at the top level
         cls_score: v["cls"].as_f64(),
-        // TBT requires a pre-load observer (addScriptToEvaluateOnNewDocument);
-        // not available via standard WebDriver without a pre-load hook.
         tbt_ms: None,
         dom_content_loaded_ms: p["dcl"].as_f64(),
         load_ms: load,
     };
+
+    // Flag performance anomalies
+    if let Some(fcp) = perf.fcp_ms {
+        if fcp >= 3000.0 {
+            page_issues.push(Issue { severity: Severity::Error, category: IssueCategory::Performance, message: format!("FCP is very slow: {:.0}ms (error > 3s)", fcp), page_url: url.to_string(), element: None, action_path: vec![] });
+        } else if fcp >= 1800.0 {
+            page_issues.push(Issue { severity: Severity::Warning, category: IssueCategory::Performance, message: format!("FCP is slow: {:.0}ms (warn > 1.8s)", fcp), page_url: url.to_string(), element: None, action_path: vec![] });
+        }
+    }
+    if let Some(lcp) = perf.lcp_ms {
+        if lcp >= 4000.0 {
+            page_issues.push(Issue { severity: Severity::Error, category: IssueCategory::Performance, message: format!("LCP is very slow: {:.0}ms (error > 4s)", lcp), page_url: url.to_string(), element: None, action_path: vec![] });
+        } else if lcp >= 2500.0 {
+            page_issues.push(Issue { severity: Severity::Warning, category: IssueCategory::Performance, message: format!("LCP is slow: {:.0}ms (warn > 2.5s)", lcp), page_url: url.to_string(), element: None, action_path: vec![] });
+        }
+    }
+    if let Some(tti) = perf.tti_ms {
+        if tti >= 7300.0 {
+            page_issues.push(Issue { severity: Severity::Error, category: IssueCategory::Performance, message: format!("TTI is very slow: {:.0}ms (error > 7.3s)", tti), page_url: url.to_string(), element: None, action_path: vec![] });
+        } else if tti >= 3800.0 {
+            page_issues.push(Issue { severity: Severity::Warning, category: IssueCategory::Performance, message: format!("TTI is slow: {:.0}ms (warn > 3.8s)", tti), page_url: url.to_string(), element: None, action_path: vec![] });
+        }
+    }
+    if let Some(cls) = perf.cls_score {
+        if cls >= 0.25 {
+            page_issues.push(Issue { severity: Severity::Error, category: IssueCategory::Performance, message: format!("CLS is extremely high: {:.3} (error > 0.25)", cls), page_url: url.to_string(), element: None, action_path: vec![] });
+        } else if cls >= 0.1 {
+            page_issues.push(Issue { severity: Severity::Warning, category: IssueCategory::Performance, message: format!("CLS is high: {:.3} (warn > 0.1)", cls), page_url: url.to_string(), element: None, action_path: vec![] });
+        }
+    }
+    if let Some(ld) = perf.load_ms {
+        if ld >= 4000.0 {
+            page_issues.push(Issue { severity: Severity::Error, category: IssueCategory::Performance, message: format!("Page load is very slow: {:.0}ms (error > 4s)", ld), page_url: url.to_string(), element: None, action_path: vec![] });
+        } else if ld >= 2000.0 {
+            page_issues.push(Issue { severity: Severity::Warning, category: IssueCategory::Performance, message: format!("Page load is slow: {:.0}ms (warn > 2s)", ld), page_url: url.to_string(), element: None, action_path: vec![] });
+        }
+    }
 
     // ── Network ──────────────────────────────────────────────────────────────
     let n = &v["net"];
@@ -498,10 +549,43 @@ async fn audit_page(
         download_ms: n["download"].as_f64(),
         resource_count: n["resource_count"].as_u64().unwrap_or(0) as usize,
         failed_resource_count: n["failed_resource_count"].as_u64().unwrap_or(0) as usize,
+        failed_resource_urls: n["failed_resource_urls"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default(),
         total_transfer_kb: n["total_transfer_kb"].as_f64().unwrap_or(0.0),
         slowest_resource_ms: n["slowest_ms"].as_f64(),
         slowest_resource_url: n["slowest_url"].as_str().map(|s| s.to_string()),
     };
+
+    // Flag network anomalies
+    if let Some(ttfb) = net.ttfb_ms {
+        if ttfb >= 600.0 {
+            page_issues.push(Issue { severity: Severity::Error, category: IssueCategory::NetworkError, message: format!("TTFB is very slow: {:.0}ms (error > 600ms)", ttfb), page_url: url.to_string(), element: None, action_path: vec![] });
+        } else if ttfb >= 200.0 {
+            page_issues.push(Issue { severity: Severity::Warning, category: IssueCategory::NetworkError, message: format!("TTFB is slow: {:.0}ms (warn > 200ms)", ttfb), page_url: url.to_string(), element: None, action_path: vec![] });
+        }
+    }
+    if net.failed_resource_count > 0 {
+        let detail = if net.failed_resource_urls.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", net.failed_resource_urls.join(", "))
+        };
+        page_issues.push(Issue {
+            severity: Severity::Error,
+            category: IssueCategory::FailedResource,
+            message: format!(
+                "{} resource{} failed to load{}",
+                net.failed_resource_count,
+                if net.failed_resource_count == 1 { "" } else { "s" },
+                detail
+            ),
+            page_url: url.to_string(),
+            element: None,
+            action_path: vec![],
+        });
+    }
 
     Ok((page_issues, perf, net, links))
 }
@@ -523,8 +607,7 @@ fn build_collect_js(base_host: &str, discover: bool, link_selector: Option<&str>
     };
     format!(
         r#"
-(function() {{
-    var cb = arguments[arguments.length - 1];
+(function(cb) {{
     var _called = false;
     var done = function(data) {{
         if (!_called) {{ _called = true; cb(JSON.stringify(data)); }}
@@ -593,7 +676,7 @@ fn build_collect_js(base_host: &str, discover: bool, link_selector: Option<&str>
                 {anchor_query}.forEach(function(el) {{
                     try {{
                         var u = new URL(el.href, location.href);
-                        if (u.host !== {base_host_json}) return;
+                        if (u.hostname !== {base_host_json}) return;
                         u.hash = ''; u.search = '';
                         if (u.pathname !== '/' && u.pathname.endsWith('/')) {{
                             u.pathname = u.pathname.slice(0, -1);
@@ -621,11 +704,14 @@ fn build_collect_js(base_host: &str, discover: bool, link_selector: Option<&str>
                        ? nav.responseEnd     - nav.responseStart      : null;
 
             var resources = performance.getEntriesByType('resource');
-            var totalBytes = 0, failedCount = 0, slowestMs = 0, slowestUrl = null;
+            var totalBytes = 0, failedCount = 0, failedUrls = [], slowestMs = 0, slowestUrl = null;
             for (var i = 0; i < resources.length; i++) {{
                 var r = resources[i];
                 if (r.transferSize) totalBytes += r.transferSize;
-                if (r.duration < 1 && r.transferSize === 0 && r.decodedBodySize === 0) failedCount++;
+                if (r.duration < 1 && r.transferSize === 0 && r.decodedBodySize === 0) {{
+                    failedCount++;
+                    failedUrls.push(r.name);
+                }}
                 if (r.duration > slowestMs) {{ slowestMs = r.duration; slowestUrl = r.name; }}
             }}
 
@@ -642,6 +728,7 @@ fn build_collect_js(base_host: &str, discover: bool, link_selector: Option<&str>
                     dns:  dns,  tcp: tcp, tls: tls, ttfb: ttfb, download: dl,
                     resource_count:        resources.length,
                     failed_resource_count: failedCount,
+                    failed_resource_urls:  failedUrls,
                     total_transfer_kb:     totalBytes / 1024,
                     slowest_ms:  slowestMs  > 0    ? slowestMs  : null,
                     slowest_url: slowestUrl !== null ? slowestUrl : null
@@ -706,7 +793,7 @@ fn build_collect_js(base_host: &str, discover: bool, link_selector: Option<&str>
         // Fallback: collect after 6s even if content threshold not met
         setTimeout(function() {{ mo.disconnect(); runCollect(); }}, 6000);
     }}
-}})()
+}})(arguments[arguments.length - 1]);
 "#,
         discover = if discover { "true" } else { "false" },
         base_host_json = serde_json::to_string(base_host).unwrap_or_else(|_| format!("\"{}\"", base_host)),
@@ -858,8 +945,12 @@ async fn perform_login(
     // Small extra wait for the rest of the form to finish rendering
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let username = auth.username.as_deref().unwrap_or("");
-    let password = auth.password.as_deref().unwrap_or("");
+    let username = auth.username.as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Login URL is configured but --auth-username was not provided"))?;
+    let password = auth.password.as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Login URL is configured but --auth-password was not provided"))?;
 
     // ── Username / email field ────────────────────────────────────────────────
     let user_el = if let Some(sel) = auth.username_selector.as_deref() {
@@ -875,10 +966,10 @@ async fn perform_login(
                 "input[type='email']",
                 "input[autocomplete='email']",
                 "input[autocomplete='username']",
-                "input[name='email']",
-                "input[name='username']",
-                "input[name='login']",
-                "input[name='user']",
+                "input[name*='email' i]",
+                "input[name*='username' i]",
+                "input[name*='login' i]",
+                "input[name*='user' i]",
                 "input[id*='email' i]",
                 "input[id*='user' i]",
                 "input[id*='login' i]",
@@ -938,8 +1029,8 @@ async fn perform_login(
         }
     });
     if (!best) return null;
-    if (best.id) return '#' + best.id;
-    if (best.name) return 'input[name="' + best.name + '"]';
+    if (best.id) return '[id="' + best.id.replace(/"/g, '\\"') + '"]';
+    if (best.name) return 'input[name="' + best.name.replace(/"/g, '\\"') + '"]';
     return null;
 })()
 "#;
@@ -964,11 +1055,52 @@ async fn perform_login(
         .send_keys(username)
         .await
         .context("Failed to type into username field")?;
+    
+    // Dispatch native events to ensure SPA frameworks (React/Vue) detect the change
+    let _ = client.execute(
+        "if (document.activeElement) { \
+             document.activeElement.dispatchEvent(new Event('input', { bubbles: true })); \
+             document.activeElement.dispatchEvent(new Event('change', { bubbles: true })); \
+         }",
+        vec![],
+    ).await;
 
     // ── Multi-step login: if password field isn't visible yet, click "Next" ──
     // Use JS visibility check (offsetParent/offsetWidth) rather than WebDriver find(),
     // which returns true for hidden elements too — avoids clicking submit prematurely
     // on single-page forms where the password field is in the DOM but display:none.
+    // Shared XPath for finding buttons like "Next", "Continue", "Submit", "Login", "Sign In"
+    let button_xpath = "//button[contains(translate(normalize-space(.), \
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')] | \
+        //button[contains(translate(normalize-space(.), \
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign-in')] | \
+        //button[contains(translate(normalize-space(.), \
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'log in')] | \
+        //button[contains(translate(normalize-space(.), \
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')] | \
+        //button[contains(translate(normalize-space(.), \
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')] | \
+        //button[contains(translate(normalize-space(.), \
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next')] | \
+        //button[contains(translate(normalize-space(.), \
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit')] | \
+        //*[@role='button' and contains(translate(normalize-space(.), \
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')] | \
+        //*[@role='button' and contains(translate(normalize-space(.), \
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'log in')] | \
+        //*[@role='button' and contains(translate(normalize-space(.), \
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')] | \
+        //input[@type='button' and contains(translate(@value, \
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')] | \
+        //input[@type='button' and contains(translate(@value, \
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')] | \
+        //button[contains(translate(@aria-label, \
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')] | \
+        //button[contains(translate(@aria-label, \
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'log in')] | \
+        //button[contains(translate(@aria-label, \
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')]";
+
     let password_immediately_visible = client
         .execute(
             "var el = document.querySelector(\"input[type='password']\"); \
@@ -979,15 +1111,43 @@ async fn perform_login(
         .ok()
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    
     if !password_immediately_visible {
-        if let Some(next_btn) = find_first(client, &[
-            "button[type='submit']",
-            "input[type='submit']",
-        ]).await {
+        let next_xpath = "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')] | \
+            //button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next')] | \
+            //input[@type='button' and contains(translate(@value, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')] | \
+            //input[@type='button' and contains(translate(@value, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next')]";
+
+        // Try precise next buttons first
+        let mut next_btn_opt = client.find(Locator::XPath(next_xpath)).await.ok();
+
+        if next_btn_opt.is_none() {
+            next_btn_opt = find_first(client, &[
+                "button[type='submit']",
+                "input[type='submit']",
+            ]).await;
+        }
+
+        if next_btn_opt.is_none() {
+            // Fallback to the broad XPath for things like a generic "Next" button
+            next_btn_opt = client.find(Locator::XPath(button_xpath)).await.ok();
+        }
+
+        if let Some(next_btn) = next_btn_opt {
             next_btn.click().await.ok();
             let step2_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             loop {
-                if client.find(Locator::Css("input[type='password']")).await.is_ok() {
+                let is_visible = client
+                    .execute(
+                        "var el = document.querySelector(\"input[type='password']\"); \
+                         return !!(el && el.offsetParent !== null && el.offsetWidth > 0 && el.offsetHeight > 0);",
+                        vec![],
+                    )
+                    .await
+                    .ok()
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if is_visible {
                     break;
                 }
                 if tokio::time::Instant::now() >= step2_deadline {
@@ -1014,6 +1174,8 @@ async fn perform_login(
                 "input[aria-label*='password' i]",
                 "input[title*='password' i]",
                 "input[placeholder*='password' i]",
+                "input[name*='password' i]",
+                "input[id*='password' i]",
                 "input[name*='pass' i]",
                 "input[id*='pass' i]",
             ],
@@ -1028,12 +1190,17 @@ async fn perform_login(
         .await
         .context("Failed to type into password field")?;
 
-    // ── Submit / sign-in button ───────────────────────────────────────────────
-    let submit_el = if let Some(sel) = auth.submit_selector.as_deref() {
-        client
-            .find(Locator::Css(sel))
-            .await
-            .map_err(|_| anyhow::anyhow!("Submit selector '{}' matched nothing", sel))?
+    // Dispatch native events for password
+    let _ = client.execute(
+        "if (document.activeElement) { \
+             document.activeElement.dispatchEvent(new Event('input', { bubbles: true })); \
+             document.activeElement.dispatchEvent(new Event('change', { bubbles: true })); \
+         }",
+        vec![],
+    ).await;
+
+    let submit_el_opt = if let Some(sel) = auth.submit_selector.as_deref() {
+        client.find(Locator::Css(sel)).await.ok()
     } else {
         // 1. Explicit type=submit or type=image (image submit buttons)
         if let Some(el) = find_first(client, &[
@@ -1041,82 +1208,126 @@ async fn perform_login(
             "input[type='submit']",
             "input[type='image']",
         ]).await {
-            el
+            Some(el)
         } else {
             // 2. Button or role=button whose visible text or aria-label contains login keyword
-            let xp = "//button[contains(translate(normalize-space(.), \
-                'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')] | \
-                //button[contains(translate(normalize-space(.), \
-                'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'log in')] | \
-                //button[contains(translate(normalize-space(.), \
-                'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')] | \
-                //button[contains(translate(normalize-space(.), \
-                'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')] | \
-                //button[contains(translate(normalize-space(.), \
-                'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next')] | \
-                //button[contains(translate(normalize-space(.), \
-                'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit')] | \
-                //*[@role='button' and contains(translate(normalize-space(.), \
-                'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')] | \
-                //*[@role='button' and contains(translate(normalize-space(.), \
-                'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'log in')] | \
-                //*[@role='button' and contains(translate(normalize-space(.), \
-                'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')] | \
-                //input[@type='button' and contains(translate(@value, \
-                'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')] | \
-                //input[@type='button' and contains(translate(@value, \
-                'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')] | \
-                //button[contains(translate(@aria-label, \
-                'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')] | \
-                //button[contains(translate(@aria-label, \
-                'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'log in')] | \
-                //button[contains(translate(@aria-label, \
-                'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')]";
-            if let Ok(el) = client.find(Locator::XPath(xp)).await {
-                el
+            if let Ok(el) = client.find(Locator::XPath(button_xpath)).await {
+                Some(el)
             } else {
                 // 3. Last button inside a <form>, then last button on the page
                 let all = client
                     .find_all(Locator::Css("form button, form [role='button'], button, [role='button']"))
                     .await
                     .unwrap_or_default();
-                all.into_iter()
-                    .last()
-                    .ok_or_else(|| anyhow::anyhow!("Could not find any button on login page"))?
+                all.into_iter().last()
             }
         }
     };
 
-    submit_el.click().await.context("Failed to click sign-in button")?;
+    if let Some(submit_el) = submit_el_opt {
+        submit_el.click().await.context("Failed to click sign-in button")?;
+    } else {
+        // No submit button found. Fall back to pressing Enter in the password field.
+        pass_el.send_keys("\u{e007}").await.context("Failed to send Enter key to password field as a fallback submit")?;
+    }
 
-    tokio::time::sleep(Duration::from_millis(settle_ms.max(1500))).await;
-    wait_for_dom_ready(client, Duration::from_secs(8)).await;
+    // Wait up to 10 seconds for the login transition to complete
+    let login_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut final_url = String::new();
+    let mut still_on_login = true;
 
-    // ── Login verification ────────────────────────────────────────────────────
-    if let Ok(current_url) = client.current_url().await {
-        let current = current_url.as_str();
-        // Check if we're still on the login page: exact prefix match, or a path segment
-        // matches known auth keywords. Using segment matching avoids false positives like
-        // "/settings/login-history" or "/dashboard?from=login".
-        let still_on_login = current.starts_with(login_url.as_str()) || {
-            Url::parse(current).ok().map(|u| {
-                let path = u.path().to_lowercase();
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        if let Ok(current_url) = client.current_url().await {
+            let current = current_url.as_str();
+            final_url = current.to_string();
+
+            let url_indicates_login_page = Url::parse(current).ok().map(|mut cu| {
+                if let Ok(mut lu) = Url::parse(&login_url) {
+                    cu.set_query(None);
+                    cu.set_fragment(None);
+                    lu.set_query(None);
+                    lu.set_fragment(None);
+                    if cu == lu {
+                        return true;
+                    }
+                }
+                let path = cu.path().to_lowercase();
                 path.split('/').any(|seg| {
                     matches!(seg, "login" | "signin" | "sign-in" | "auth" | "authenticate")
                 })
-            }).unwrap_or(false)
-        };
-        if still_on_login {
-            eprintln!(
-                "  {} Login may have failed — still on login page: {}",
-                console::style("⚠").yellow().bold(),
-                current
-            );
-            eprintln!(
-                "  {} Check credentials or use --auth-username-selector / --auth-password-selector",
-                console::style("│").yellow().dim()
-            );
+            }).unwrap_or(false);
+
+            let password_visible = client
+                .execute(
+                    "var el = document.querySelector(\"input[type='password']\"); \
+                     return !!(el && el.offsetParent !== null && el.offsetWidth > 0 && el.offsetHeight > 0);",
+                    vec![],
+                )
+                .await
+                .ok()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            still_on_login = url_indicates_login_page && password_visible;
+
+            if !still_on_login {
+                break;
+            }
         }
+
+        if tokio::time::Instant::now() >= login_deadline {
+            break;
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(settle_ms.max(500))).await;
+    wait_for_dom_ready(client, Duration::from_secs(8)).await;
+
+    // Additionally check if the page body indicates a generic auth failure
+    let body_text = client
+        .execute("return document.body ? document.body.innerText.toLowerCase() : '';", vec![])
+        .await
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    // Check for CAPTCHA / Anti-Bot signatures
+    let indicates_bot_check = body_text.contains("cf-turnstile")
+        || body_text.contains("cloudflare")
+        || body_text.contains("recaptcha")
+        || body_text.contains("hcaptcha")
+        || body_text.contains("datadome")
+        || body_text.contains("security check")
+        || body_text.contains("verify you are human")
+        || body_text.contains("pardon our interruption");
+
+    if indicates_bot_check {
+        anyhow::bail!(
+            "{} Login blocked by an anti-bot challenge (CAPTCHA/Cloudflare). The crawler cannot proceed.",
+            console::style("⚠").red().bold()
+        );
+    }
+
+    let indicates_error = body_text.contains("forbidden")
+        || body_text.contains("unauthorized")
+        || body_text.contains("invalid credentials")
+        || body_text.contains("incorrect password")
+        || body_text.contains("wrong password")
+        || body_text.contains("invalid email")
+        || body_text.contains("incorrect email")
+        || body_text.contains("login failed")
+        || body_text.contains("authentication failed");
+
+    // ── Login verification ────────────────────────────────────────────────────
+    if still_on_login || indicates_error {
+        let msg = format!(
+            "{} Login failed — still on login page or received error: {}",
+            console::style("⚠").red().bold(),
+            final_url
+        );
+        anyhow::bail!(msg);
     }
 
     Ok(())
