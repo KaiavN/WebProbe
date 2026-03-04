@@ -291,8 +291,7 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
             tx.send(post_state).await.ok();
         }
     }
-    // Also add any links discovered on the login page itself
-    if let Ok(auth_u) = Url::parse(&login_url_for_stats) {
+    if let Ok(_ /* auth_u */) = Url::parse(&login_url_for_stats) {
         let login_state = PageState::new(&login_url_for_stats);
         for link in login_discovered_links {
             if !config.skip_paths.is_empty() {
@@ -453,10 +452,27 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
     drop(driver);
 
     let pages_visited = pages_visited.load(Ordering::Relaxed);
-    let all_issues = Arc::try_unwrap(all_issues)
+    let all_issues_raw = Arc::try_unwrap(all_issues)
         .expect("worker tasks still holding Arc")
         .into_inner()
         .unwrap_or_default();
+    
+    // ── Deduplicate Issues ──
+    let mut issue_map: std::collections::HashMap<String, crate::types::Issue> = std::collections::HashMap::new();
+    for issue in all_issues_raw {
+        let key = format!("{:?}|{}|{}", issue.severity, issue.category, issue.message);
+        if let Some(existing) = issue_map.get_mut(&key) {
+            existing.page_urls.extend(issue.page_urls);
+        } else {
+            issue_map.insert(key, issue);
+        }
+    }
+    let mut all_issues: Vec<_> = issue_map.into_values().collect();
+    for issue in &mut all_issues {
+        issue.page_urls.sort();
+        issue.page_urls.dedup();
+    }
+    all_issues.sort_by(|a, b| b.severity.cmp(&a.severity));
     let all_perf = Arc::try_unwrap(all_perf)
         .expect("worker tasks still holding Arc")
         .into_inner()
@@ -474,13 +490,116 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
         .expect("worker tasks still holding Arc")
         .into_inner()
         .unwrap_or_default();
-    let mut all_interactions = Arc::try_unwrap(all_interactions)
+    let all_interactions = Arc::try_unwrap(all_interactions)
         .expect("worker tasks still holding Arc")
         .into_inner()
         .unwrap_or_default();
-    all_interactions.sort_by(|a, b| a.page_url.cmp(&b.page_url));
-    let total_elements: usize = all_interactions.iter().map(|p| p.elements_found).sum();
+
+    // ── Average Performance Metrics ──
+    let mut perf_map: std::collections::HashMap<String, Vec<crate::types::PerfMetrics>> = std::collections::HashMap::new();
+    for p in all_perf {
+        perf_map.entry(p.page_url.clone()).or_default().push(p);
+    }
+    let mut final_perf = Vec::new();
+    for (url, list) in perf_map {
+        let mut avg = crate::types::PerfMetrics { page_url: url, ..Default::default() };
+        let (mut fcp_sum, mut fcp_c) = (0.0, 0.0);
+        let (mut lcp_sum, mut lcp_c) = (0.0, 0.0);
+        let (mut tti_sum, mut tti_c) = (0.0, 0.0);
+        let (mut cls_sum, mut cls_c) = (0.0, 0.0);
+        let (mut dcl_sum, mut dcl_c) = (0.0, 0.0);
+        let (mut load_sum, mut load_c) = (0.0, 0.0);
+        for p in list {
+            if let Some(v) = p.fcp_ms { fcp_sum += v; fcp_c += 1.0; }
+            if let Some(v) = p.lcp_ms { lcp_sum += v; lcp_c += 1.0; }
+            if let Some(v) = p.tti_ms { tti_sum += v; tti_c += 1.0; }
+            if let Some(v) = p.cls_score { cls_sum += v; cls_c += 1.0; }
+            if let Some(v) = p.dom_content_loaded_ms { dcl_sum += v; dcl_c += 1.0; }
+            if let Some(v) = p.load_ms { load_sum += v; load_c += 1.0; }
+        }
+        if fcp_c > 0.0 { avg.fcp_ms = Some(fcp_sum / fcp_c); }
+        if lcp_c > 0.0 { avg.lcp_ms = Some(lcp_sum / lcp_c); }
+        if tti_c > 0.0 { avg.tti_ms = Some(tti_sum / tti_c); }
+        if cls_c > 0.0 { avg.cls_score = Some(cls_sum / cls_c); }
+        if dcl_c > 0.0 { avg.dom_content_loaded_ms = Some(dcl_sum / dcl_c); }
+        if load_c > 0.0 { avg.load_ms = Some(load_sum / load_c); }
+        final_perf.push(avg);
+    }
+    final_perf.sort_by(|a, b| a.page_url.cmp(&b.page_url));
+
+    // ── Average Network Stats ──
+    let mut net_map: std::collections::HashMap<String, Vec<crate::types::NetworkStats>> = std::collections::HashMap::new();
+    for n in all_network {
+        net_map.entry(n.page_url.clone()).or_default().push(n);
+    }
+    let mut final_net = Vec::new();
+    for (url, list) in net_map {
+        let mut avg = crate::types::NetworkStats { page_url: url, ..Default::default() };
+        let (mut dns_sum, mut dns_c) = (0.0, 0.0);
+        let (mut tcp_sum, mut tcp_c) = (0.0, 0.0);
+        let (mut tls_sum, mut tls_c) = (0.0, 0.0);
+        let (mut ttfb_sum, mut ttfb_c) = (0.0, 0.0);
+        let (mut dl_sum, mut dl_c) = (0.0, 0.0);
+        let mut max_res = 0;
+        let mut max_fail = 0;
+        let mut max_kb = 0.0;
+        let mut slowest_ms = 0.0;
+        let mut slowest_url = String::new();
+        let mut all_failed = Vec::new();
+        
+        for n in list {
+            if let Some(v) = n.dns_ms { dns_sum += v; dns_c += 1.0; }
+            if let Some(v) = n.tcp_connect_ms { tcp_sum += v; tcp_c += 1.0; }
+            if let Some(v) = n.tls_ms { tls_sum += v; tls_c += 1.0; }
+            if let Some(v) = n.ttfb_ms { ttfb_sum += v; ttfb_c += 1.0; }
+            if let Some(v) = n.download_ms { dl_sum += v; dl_c += 1.0; }
+            
+            if n.resource_count > max_res { max_res = n.resource_count; }
+            if n.failed_resource_count > max_fail { max_fail = n.failed_resource_count; }
+            if n.total_transfer_kb > max_kb { max_kb = n.total_transfer_kb; }
+            if let Some(sms) = n.slowest_resource_ms {
+                if sms > slowest_ms {
+                    slowest_ms = sms;
+                    slowest_url = n.slowest_resource_url.clone().unwrap_or_default();
+                }
+            }
+            all_failed.extend(n.failed_resource_urls);
+        }
+        
+        if dns_c > 0.0 { avg.dns_ms = Some(dns_sum / dns_c); }
+        if tcp_c > 0.0 { avg.tcp_connect_ms = Some(tcp_sum / tcp_c); }
+        if tls_c > 0.0 { avg.tls_ms = Some(tls_sum / tls_c); }
+        if ttfb_c > 0.0 { avg.ttfb_ms = Some(ttfb_sum / ttfb_c); }
+        if dl_c > 0.0 { avg.download_ms = Some(dl_sum / dl_c); }
+        
+        avg.resource_count = max_res;
+        avg.failed_resource_count = max_fail;
+        all_failed.sort();
+        all_failed.dedup();
+        avg.failed_resource_urls = all_failed;
+        avg.total_transfer_kb = max_kb;
+        if slowest_ms > 0.0 {
+            avg.slowest_resource_ms = Some(slowest_ms);
+            avg.slowest_resource_url = Some(slowest_url);
+        }
+        final_net.push(avg);
+    }
+    final_net.sort_by(|a, b| a.page_url.cmp(&b.page_url));
+
+    // ── Deduplicate Interactions ──
+    let mut inter_map: std::collections::HashMap<String, crate::types::PageInteractions> = std::collections::HashMap::new();
+    for i in all_interactions {
+        let entry = inter_map.entry(i.page_url.clone()).or_insert_with(|| i.clone());
+        if i.elements_found > entry.elements_found {
+            *entry = i;
+        }
+    }
+    let mut final_inter = inter_map.into_values().collect::<Vec<_>>();
+    final_inter.sort_by(|a, b| a.page_url.cmp(&b.page_url));
+    let total_elements: usize = final_inter.iter().map(|p| p.elements_found).sum();
+
     // Merge crawled URLs into discovered so the set is a true superset
+    all_crawled.dedup();
     all_discovered_links.extend(all_crawled.clone());
     all_discovered_links.sort();
     all_discovered_links.dedup();
@@ -498,16 +617,16 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
 
     Ok(CrawlResult {
         issues: all_issues,
-        perf_metrics: all_perf,
-        network_stats: all_network,
+        perf_metrics: final_perf,
+        network_stats: final_net,
         stats: CrawlStats {
-            pages_visited,
+            pages_visited: all_crawled.len(), // Use deduped count
             duration_secs: start.elapsed().as_secs_f64(),
             elements_interacted: total_elements,
             crawled_urls: all_crawled,
         },
         discovered_urls: all_discovered_links,
-        interactions: all_interactions,
+        interactions: final_inter,
     })
 }
 
@@ -626,7 +745,7 @@ async fn audit_page(
                 severity,
                 category,
                 message: item["msg"].as_str().unwrap_or("").to_string(),
-                page_url: url.to_string(),
+                page_urls: vec![url.to_string()],
                 element: item["el"].as_str().map(|s| s.to_string()),
                 action_path: vec![],
             });
@@ -663,7 +782,7 @@ async fn audit_page(
                 severity: Severity::Error,
                 category: IssueCategory::Performance,
                 message: format!("FCP is very slow: {:.0}ms (error > 3s)", fcp),
-                page_url: url.to_string(),
+                page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
             });
@@ -672,7 +791,7 @@ async fn audit_page(
                 severity: Severity::Warning,
                 category: IssueCategory::Performance,
                 message: format!("FCP is slow: {:.0}ms (warn > 1.8s)", fcp),
-                page_url: url.to_string(),
+                page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
             });
@@ -684,7 +803,7 @@ async fn audit_page(
                 severity: Severity::Error,
                 category: IssueCategory::Performance,
                 message: format!("LCP is very slow: {:.0}ms (error > 4s)", lcp),
-                page_url: url.to_string(),
+                page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
             });
@@ -693,7 +812,7 @@ async fn audit_page(
                 severity: Severity::Warning,
                 category: IssueCategory::Performance,
                 message: format!("LCP is slow: {:.0}ms (warn > 2.5s)", lcp),
-                page_url: url.to_string(),
+                page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
             });
@@ -705,7 +824,7 @@ async fn audit_page(
                 severity: Severity::Error,
                 category: IssueCategory::Performance,
                 message: format!("TTI is very slow: {:.0}ms (error > 7.3s)", tti),
-                page_url: url.to_string(),
+                page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
             });
@@ -714,7 +833,7 @@ async fn audit_page(
                 severity: Severity::Warning,
                 category: IssueCategory::Performance,
                 message: format!("TTI is slow: {:.0}ms (warn > 3.8s)", tti),
-                page_url: url.to_string(),
+                page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
             });
@@ -726,7 +845,7 @@ async fn audit_page(
                 severity: Severity::Error,
                 category: IssueCategory::Performance,
                 message: format!("CLS is extremely high: {:.3} (error > 0.25)", cls),
-                page_url: url.to_string(),
+                page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
             });
@@ -735,7 +854,7 @@ async fn audit_page(
                 severity: Severity::Warning,
                 category: IssueCategory::Performance,
                 message: format!("CLS is high: {:.3} (warn > 0.1)", cls),
-                page_url: url.to_string(),
+                page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
             });
@@ -747,7 +866,7 @@ async fn audit_page(
                 severity: Severity::Error,
                 category: IssueCategory::Performance,
                 message: format!("Page load is very slow: {:.0}ms (error > 4s)", ld),
-                page_url: url.to_string(),
+                page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
             });
@@ -756,7 +875,7 @@ async fn audit_page(
                 severity: Severity::Warning,
                 category: IssueCategory::Performance,
                 message: format!("Page load is slow: {:.0}ms (warn > 2s)", ld),
-                page_url: url.to_string(),
+                page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
             });
@@ -794,7 +913,7 @@ async fn audit_page(
                 severity: Severity::Error,
                 category: IssueCategory::NetworkError,
                 message: format!("TTFB is very slow: {:.0}ms (error > 600ms)", ttfb),
-                page_url: url.to_string(),
+                page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
             });
@@ -803,7 +922,7 @@ async fn audit_page(
                 severity: Severity::Warning,
                 category: IssueCategory::NetworkError,
                 message: format!("TTFB is slow: {:.0}ms (warn > 200ms)", ttfb),
-                page_url: url.to_string(),
+                page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
             });
@@ -828,7 +947,7 @@ async fn audit_page(
                 },
                 detail
             ),
-            page_url: url.to_string(),
+            page_urls: vec![url.to_string()],
             element: None,
             action_path: vec![],
         });

@@ -41,44 +41,17 @@ pub fn print_report(report: &Report) {
         // Deduplicate: issues appearing on many pages are shown once as "global" issues
         // to avoid flooding the output (e.g. "missing lang attr" on every page).
         let dedup_threshold = 3usize;
-        let mut freq: std::collections::HashMap<String, Vec<&str>> =
-            std::collections::HashMap::new();
-        for issue in &report.issues {
-            let key = format!("{}|{}", issue.category, issue.message);
-            freq.entry(key).or_default().push(issue.page_url.as_str());
-        }
-        // Keys considered "global" (appear on many pages)
-        let global_keys: std::collections::HashSet<String> = freq
-            .iter()
-            .filter(|(_, pages)| pages.len() >= dedup_threshold)
-            .map(|(k, _)| k.clone())
-            .collect();
+        let (mut global_issues, local_issues): (Vec<_>, Vec<_>) = report.issues.iter().partition(|i| i.page_urls.len() >= dedup_threshold);
 
         // ── Global / site-wide issues ──────────────────────────────────────
-        if !global_keys.is_empty() {
+        if !global_issues.is_empty() {
             println!(
                 "\n{}",
                 style("  ── Site-wide Issues ──────────────────────────────────────").dim()
             );
-            let mut global_issues: Vec<_> = report
-                .issues
-                .iter()
-                .filter(|i| global_keys.contains(&format!("{}|{}", i.category, i.message)))
-                // deduplicate to one entry per (category, message)
-                .fold(
-                    std::collections::BTreeMap::<String, &crate::types::Issue>::new(),
-                    |mut m, i| {
-                        let k = format!("{}|{}", i.category, i.message);
-                        m.entry(k).or_insert(i);
-                        m
-                    },
-                )
-                .into_values()
-                .collect();
             global_issues.sort_by(|a, b| b.severity.cmp(&a.severity));
             for issue in global_issues {
-                let key = format!("{}|{}", issue.category, issue.message);
-                let n_pages = freq[&key].len();
+                let n_pages = issue.page_urls.len();
                 let (icon, sev_str) = severity_style(&issue.severity);
                 let cat = style(format!("[{}]", issue.category)).dim();
                 println!(
@@ -95,18 +68,17 @@ pub fn print_report(report: &Report) {
         // ── Per-page issues (excluding global ones) ────────────────────────
         let mut by_page: std::collections::BTreeMap<&str, Vec<_>> =
             std::collections::BTreeMap::new();
-        for issue in &report.issues {
-            let key = format!("{}|{}", issue.category, issue.message);
-            if !global_keys.contains(&key) {
+        for issue in &local_issues {
+            for url in &issue.page_urls {
                 by_page
-                    .entry(issue.page_url.as_str())
+                    .entry(url.as_str())
                     .or_default()
-                    .push(issue);
+                    .push(*issue);
             }
         }
 
         for (page, issues) in &by_page {
-            println!("\n  {}", style(page).underlined().bold());
+            println!("\n  {}", style(*page).underlined().bold());
             let mut sorted = issues.clone();
             sorted.sort_by(|a, b| b.severity.cmp(&a.severity));
             for issue in sorted {
@@ -121,15 +93,16 @@ pub fn print_report(report: &Report) {
     }
 
     // ── Per-page interactive elements ──────────────────────────────────────
-    if !report.interactions.is_empty() {
+    let pages_with_interactions: Vec<_> = report.pages.iter().filter_map(|p| p.interactions.as_ref().map(|i| (p.url.as_str(), i))).collect();
+    if !pages_with_interactions.is_empty() {
         println!(
             "\n{}",
             style("  ── Interactive Elements ─────────────────────────────────").dim()
         );
-        for pi in &report.interactions {
+        for (url, pi) in pages_with_interactions {
             println!(
                 "  {}  →  {} element{}",
-                style(&pi.page_url).dim(),
+                style(url).dim(),
                 pi.elements_found,
                 if pi.elements_found == 1 { "" } else { "s" }
             );
@@ -191,12 +164,13 @@ pub fn print_report(report: &Report) {
     }
 
     // ── Performance ────────────────────────────────────────────────────────
-    if !report.perf_metrics.is_empty() {
+    let pages_with_perf: Vec<_> = report.pages.iter().filter_map(|p| p.perf_metrics.as_ref().map(|i| (p.url.as_str(), i))).collect();
+    if !pages_with_perf.is_empty() {
         println!(
             "\n{}",
             style("  ── Performance ──────────────────────────────────────────").dim()
         );
-        for p in &report.perf_metrics {
+        for (url, p) in pages_with_perf {
             let has_data = p.fcp_ms.is_some()
                 || p.lcp_ms.is_some()
                 || p.load_ms.is_some()
@@ -205,7 +179,7 @@ pub fn print_report(report: &Report) {
             if !has_data {
                 continue;
             }
-            println!("  {}", style(&p.page_url).dim());
+            println!("  {}", style(url).dim());
             if let Some(fcp) = p.fcp_ms {
                 let s = perf_color(fcp, 1800.0, 3000.0);
                 println!("    FCP:  {}ms", s(format!("{:.0}", fcp)));
@@ -233,13 +207,14 @@ pub fn print_report(report: &Report) {
     }
 
     // ── Network Stats ──────────────────────────────────────────────────────
-    if !report.network_stats.is_empty() {
+    let pages_with_net: Vec<_> = report.pages.iter().filter_map(|p| p.network_stats.as_ref().map(|i| (p.url.as_str(), i))).collect();
+    if !pages_with_net.is_empty() {
         println!(
             "\n{}",
             style("  ── Network Stats ─────────────────────────────────────────").dim()
         );
-        for n in &report.network_stats {
-            println!("  {}", style(&n.page_url).dim());
+        for (url, n) in pages_with_net {
+            println!("  {}", style(url).dim());
             if let Some(dns) = n.dns_ms {
                 if dns > 0.1 { println!("    DNS:      {:.1}ms", dns); }
             }

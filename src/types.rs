@@ -70,7 +70,7 @@ impl fmt::Display for Severity {
 
 // ── Issue Category ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueCategory {
     ConsoleError,
@@ -109,8 +109,9 @@ pub struct Issue {
     pub severity: Severity,
     pub category: IssueCategory,
     pub message: String,
-    /// The page URL where this was found
-    pub page_url: String,
+    /// The page URLs where this was found
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub page_urls: Vec<String>,
     /// The element selector or description that triggered this (if applicable)
     pub element: Option<String>,
     /// The action path taken to reach this state
@@ -145,8 +146,6 @@ impl PageState {
 
     /// Fingerprint used for deduplication
     pub fn fingerprint(&self) -> String {
-        let mut sorted_path = self.action_path.clone();
-        sorted_path.sort();
         // Normalize URL: strip trailing slash (except root /)
         let norm_url =
             if self.url.ends_with('/') && self.url.len() > 1 && !self.url.ends_with("://") {
@@ -154,7 +153,7 @@ impl PageState {
             } else {
                 self.url.clone()
             };
-        format!("{}|{}", norm_url, sorted_path.join(";"))
+        norm_url
     }
 
     pub fn child(&self, url: impl Into<String>, action: &str) -> Self {
@@ -219,6 +218,7 @@ pub struct LoadTestResult {
 /// Per-page network timing collected via the browser's Performance API.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NetworkStats {
+    #[serde(skip)]
     pub page_url: String,
     /// DNS lookup time for the main document (ms) — always 0 on localhost
     #[serde(skip_serializing_if = "crate::types::is_zero_f64")]
@@ -273,6 +273,7 @@ pub struct InteractiveElement {
 /// All interactive elements found on a single page.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PageInteractions {
+    #[serde(skip)]
     pub page_url: String,
     /// Total interactive elements found
     pub elements_found: usize,
@@ -295,21 +296,29 @@ pub struct CrawlStats {
 // ── Full Report ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageReport {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub perf_metrics: Option<PerfMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_stats: Option<NetworkStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interactions: Option<PageInteractions>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub tool: String,
     pub version: String,
     pub timestamp: DateTime<Utc>,
     pub target_url: String,
     pub issues: Vec<Issue>,
-    pub perf_metrics: Vec<PerfMetrics>,
-    pub network_stats: Vec<NetworkStats>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pages: Vec<PageReport>,
     pub crawl_stats: CrawlStats,
     /// All unique internal URLs discovered via link-following (superset of crawled_urls)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discovered_urls: Vec<String>,
-    /// Per-page interactive element details
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub interactions: Vec<PageInteractions>,
     pub load_test: Option<LoadTestResult>,
     /// Issue counts by severity
     pub summary: ReportSummary,
@@ -332,11 +341,9 @@ impl Report {
             timestamp: Utc::now(),
             target_url: target_url.into(),
             issues: vec![],
-            perf_metrics: vec![],
-            network_stats: vec![],
+            pages: vec![],
             crawl_stats: CrawlStats::default(),
             discovered_urls: vec![],
-            interactions: vec![],
             load_test: None,
             summary: ReportSummary::default(),
         }
@@ -354,5 +361,35 @@ impl Report {
         }
         s.total = self.issues.len();
         self.summary = s;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_page_state_fingerprint_deduplication() {
+        let mut state1 = PageState::new("http://example.com/login");
+        let mut state2 = PageState::new("http://example.com/login");
+
+        // state1 got here directly
+        state1.action_path = vec![];
+
+        // state2 got here via some other page (ping-pong)
+        state2.action_path = vec!["link".to_string(), "button_click".to_string()];
+
+        // Their fingerprints MUST be identical so they deduplicate correctly
+        assert_eq!(
+            state1.fingerprint(),
+            state2.fingerprint(),
+            "Fingerprints must match ignoring action path to prevent infinite ping-ponging across cross-linked pages"
+        );
+
+        // Also test root URL normalization
+        assert_eq!(PageState::new("http://example.com").fingerprint(), "http://example.com");
+        assert_eq!(PageState::new("http://example.com/").fingerprint(), "http://example.com");
+        assert_eq!(PageState::new("http://example.com/path").fingerprint(), "http://example.com/path");
+        assert_eq!(PageState::new("http://example.com/path/").fingerprint(), "http://example.com/path");
     }
 }

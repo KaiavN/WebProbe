@@ -862,9 +862,43 @@ async fn main() -> Result<()> {
 
             let mut report = Report::new(&url);
             report.issues = crawl_result.issues;
-            report.perf_metrics = crawl_result.perf_metrics;
-            report.network_stats = crawl_result.network_stats;
             report.crawl_stats = crawl_result.stats;
+            
+            // Group perf, net, and interaction stats into PageReports
+            let mut page_reports: std::collections::BTreeMap<String, crate::types::PageReport> = std::collections::BTreeMap::new();
+            
+            for perf in crawl_result.perf_metrics {
+                let entry = page_reports.entry(perf.page_url.clone()).or_insert_with(|| crate::types::PageReport {
+                    url: perf.page_url.clone(),
+                    perf_metrics: None,
+                    network_stats: None,
+                    interactions: None,
+                });
+                entry.perf_metrics = Some(perf);
+            }
+            
+            for net in crawl_result.network_stats {
+                let entry = page_reports.entry(net.page_url.clone()).or_insert_with(|| crate::types::PageReport {
+                    url: net.page_url.clone(),
+                    perf_metrics: None,
+                    network_stats: None,
+                    interactions: None,
+                });
+                entry.network_stats = Some(net);
+            }
+            
+            for inter in crawl_result.interactions {
+                let entry = page_reports.entry(inter.page_url.clone()).or_insert_with(|| crate::types::PageReport {
+                    url: inter.page_url.clone(),
+                    perf_metrics: None,
+                    network_stats: None,
+                    interactions: None,
+                });
+                entry.interactions = Some(inter);
+            }
+            
+            report.pages = page_reports.into_values().collect();
+
             let discovered = {
                 let mut urls = crawl_result.discovered_urls;
                 urls.sort();
@@ -872,7 +906,6 @@ async fn main() -> Result<()> {
                 urls
             };
             report.discovered_urls = discovered.clone();
-            report.interactions = crawl_result.interactions;
 
             if !no_load && users > 0 {
                 let load_urls = if discovered.is_empty() {
