@@ -23,7 +23,8 @@ Built for developers who want to catch problems before they reach production.
 
 ## CLI Demo
 
-![Adobe Express - Screen Recording 2026-03-05 at 11 18 58](https://github.com/user-attachments/assets/2020d8ff-b803-44b8-818a-49c5cf114c6f)
+![Screen Recording 2026-03-05 at 11 18 58](https://github.com/user-attachments/assets/c891bd4f-5a88-4973-bf9f-eb034d11851a)
+
 Demo using a running vite server on localhost:5173
 ---
 
