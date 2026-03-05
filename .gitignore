@@ -1,3 +1,5 @@
 /target
 report-*.json
 load-*.json
+.node_modules
+.npm
