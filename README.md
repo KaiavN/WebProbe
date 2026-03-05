@@ -20,6 +20,11 @@ Built for developers who want to catch problems before they reach production.
 - **Saved auth profiles** — store login credentials once and reuse them across runs
 - **Timestamped reports** — every run writes a new `report-YYYYMMDD-HHMMSS.json`, never overwriting previous results
 
+
+## CLI Demo
+
+https://github.com/user-attachments/assets/feb46009-e9a8-47a7-9296-3e146a5c5f29
+Demo using a running vite server on localhost:5173
 ---
 
 ## Install
