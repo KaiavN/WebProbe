@@ -13,6 +13,7 @@ Built for developers who want to catch problems before they reach production.
 - **Accessibility auditing** — missing `alt`, unlabelled inputs, empty buttons, unlabelled links
 - **SEO checks** — missing `<title>` / `<meta description>` / `<meta viewport>` / `<html lang>`, duplicate `<h1>`, title too long
 - **Security checks** — `<a target="_blank">` without `rel="noopener noreferrer"`
+- **Penetration testing** — comprehensive security audit enabled by default; use `--no-pentest` to skip: security headers, cookie security, CORS, CSRF, JWT analysis, IDOR, SQL injection, XSS, open redirect, directory traversal, SSTI, SSRF, file upload risks, mixed content
 - **Runtime JS error capture** — `window.onerror`, `unhandledrejection`, and `console.error` are all intercepted and reported per page
 - **Performance metrics** — FCP, LCP, TTI, CLS, DCL, Load per page, colour-coded against Web Vitals thresholds
 - **Network statistics** — TTFB, resource counts, total transfer size, slowest resource, and exact URLs of any failed resources
@@ -95,6 +96,8 @@ Crawl every route, run an accessibility + performance audit on each page, then r
 | `--skip <PATHS>` | — | Comma-separated paths to never crawl (e.g. `/map,/logout`) |
 | `--headed` | off | Show Firefox window (useful for debugging auth) |
 | `--no-load` | off | Skip the load test phase |
+| `--no-pentest` | off (pentest enabled by default) | Skip penetration testing checks (security headers, cookies, CORS, CSRF, JWT, SQLi, XSS, open redirect, directory traversal, IDOR, SSTI, SSRF, file upload, mixed content) |
+| `--separate-reports` | off | Write separate report files: `(basename).crawl.json` (crawl issues), `(basename).pentest.json` (security issues), and `(basename).load.json` (load test). The combined report is still printed to the console. |
 
 **Auth flags:**
 
@@ -456,6 +459,9 @@ webprobe load 8080 --users 50 --duration 120
 
 # Save to a specific report path
 webprobe crawl 4000 --no-load --output my-audit.json
+
+# Save separate reports for crawl, pentest, and load results
+webprobe crawl 3000 --separate-reports
 ```
 
 ---

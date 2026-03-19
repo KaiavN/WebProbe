@@ -1,10 +1,11 @@
 pub mod browser;
 pub mod element;
+pub mod pentest;
 pub mod state;
 
 use crate::types::{
-    AuthConfig, CookieEntry, CrawlStats, InteractiveElement, Issue, IssueCategory, NetworkStats,
-    PageInteractions, PageState, PerfMetrics, Severity,
+    AuthConfig, CookieEntry, CrawlStats, Issue, IssueCategory, NetworkStats, PageState,
+    PerfMetrics, Severity,
 };
 use anyhow::{Context, Result};
 use async_channel;
@@ -33,15 +34,14 @@ pub struct CrawlerConfig {
     /// CSS selector to scope link discovery (only follow links inside matching elements).
     /// None = discover all <a href> links on the page.
     pub link_selector: Option<String>,
+    /// Enable penetration testing checks.
+    pub pentest: bool,
 }
 
 pub struct CrawlResult {
     pub issues: Vec<Issue>,
-    pub perf_metrics: Vec<PerfMetrics>,
-    pub network_stats: Vec<NetworkStats>,
     pub stats: CrawlStats,
     pub discovered_urls: Vec<String>,
-    pub interactions: Vec<PageInteractions>,
 }
 
 /// Open a browser session — capabilities differ between Firefox, Chrome, and Safari.
@@ -162,11 +162,8 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
     }
 
     let all_issues: Arc<Mutex<Vec<Issue>>> = Arc::new(Mutex::new(Vec::new()));
-    let all_perf: Arc<Mutex<Vec<PerfMetrics>>> = Arc::new(Mutex::new(Vec::new()));
-    let all_network: Arc<Mutex<Vec<NetworkStats>>> = Arc::new(Mutex::new(Vec::new()));
     let all_discovered: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let all_crawled: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let all_interactions: Arc<Mutex<Vec<PageInteractions>>> = Arc::new(Mutex::new(Vec::new()));
     let pages_visited = Arc::new(AtomicUsize::new(0));
     let issue_count = Arc::new(AtomicUsize::new(0));
 
@@ -208,16 +205,16 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
         )
         .await
         {
-            Ok((issues, perf, net, links, page_interactions)) => {
+            Ok((issues, links)) => {
                 println!("{}", style("ok").green().bold());
                 // Record the post-login URL so we can seed it into the BFS below.
                 // After a successful login the browser is usually on the dashboard/home
                 // page, which may be a different route than start_url.
                 if let Ok(landed) = sessions[0].current_url().await {
-                    let landed_str = landed.to_string();
+                    let landed_str = crate::types::normalize_url(landed.as_str());
                     login_url_for_stats = landed_str.clone(); // The URL we are auditing
-                    let norm_landed = landed_str.trim_end_matches('/');
-                    let norm_start = config.start_url.trim_end_matches('/');
+                    let norm_landed = landed_str.clone();
+                    let norm_start = crate::types::normalize_url(&config.start_url);
                     if norm_landed != norm_start {
                         post_login_url = Some(landed_str);
                     }
@@ -241,15 +238,6 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
                 // Add the login page data to global crawler stats
                 if let Ok(mut g) = all_issues.lock() {
                     g.extend(issues);
-                }
-                if let Ok(mut g) = all_perf.lock() {
-                    g.push(perf);
-                }
-                if let Ok(mut g) = all_network.lock() {
-                    g.push(net);
-                }
-                if let Ok(mut g) = all_interactions.lock() {
-                    g.push(page_interactions);
                 }
                 // Use the initial login_url (or current url) for crawled stats
                 if let Ok(mut g) = all_crawled.lock() {
@@ -337,11 +325,8 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
         let pending = Arc::clone(&pending);
         let tracker = tracker.clone();
         let all_issues = Arc::clone(&all_issues);
-        let all_perf = Arc::clone(&all_perf);
-        let all_network = Arc::clone(&all_network);
         let all_discovered = Arc::clone(&all_discovered);
         let all_crawled = Arc::clone(&all_crawled);
-        let all_interactions = Arc::clone(&all_interactions);
         let pages_visited = Arc::clone(&pages_visited);
         let issue_count = Arc::clone(&issue_count);
         let base_host = base_host.clone();
@@ -350,6 +335,8 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
         let pb = pb.clone();
         let skip_paths = config.skip_paths.clone();
         let link_selector = config.link_selector.clone();
+        let pentest_enabled = config.pentest;
+        let http_client = http_client.clone();
 
         handles.push(tokio::spawn(async move {
             while let Ok(state) = rx.recv().await {
@@ -364,12 +351,14 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
                         settle_ms,
                         state.depth < max_depth,
                         link_selector.as_deref(),
+                        pentest_enabled,
+                        &http_client,
                     ),
                 )
                 .await;
 
                 match result {
-                    Ok(Ok((issues, perf, net, links, page_interactions))) => {
+                    Ok(Ok((issues, links))) => {
                         let n_issues = issues.len();
                         let mut new_states = vec![];
                         for link in links {
@@ -394,19 +383,9 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
                         if let Ok(mut g) = all_issues.lock() {
                             g.extend(issues);
                         }
-                        if let Ok(mut g) = all_perf.lock() {
-                            g.push(perf);
-                        }
-                        if let Ok(mut g) = all_network.lock() {
-                            g.push(net);
-                        }
                         // crawled = pages audited; discovered = all links found across all pages
                         if let Ok(mut g) = all_crawled.lock() {
                             g.push(state.url.clone());
-                        }
-                        // store per-page interactive elements
-                        if let Ok(mut g) = all_interactions.lock() {
-                            g.push(page_interactions);
                         }
                         for link in &new_states {
                             if let Ok(mut g) = all_discovered.lock() {
@@ -473,160 +452,40 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
         issue.page_urls.dedup();
     }
     all_issues.sort_by(|a, b| b.severity.cmp(&a.severity));
-    let all_perf = Arc::try_unwrap(all_perf)
-        .expect("worker tasks still holding Arc")
-        .into_inner()
-        .unwrap_or_default();
-    let all_network = Arc::try_unwrap(all_network)
-        .expect("worker tasks still holding Arc")
-        .into_inner()
-        .unwrap_or_default();
+
     let mut all_crawled = Arc::try_unwrap(all_crawled)
         .expect("worker tasks still holding Arc")
         .into_inner()
         .unwrap_or_default();
     all_crawled.sort();
+    all_crawled.dedup();
+
     let mut all_discovered_links = Arc::try_unwrap(all_discovered)
         .expect("worker tasks still holding Arc")
         .into_inner()
         .unwrap_or_default();
-    let all_interactions = Arc::try_unwrap(all_interactions)
-        .expect("worker tasks still holding Arc")
-        .into_inner()
-        .unwrap_or_default();
-
-    // ── Average Performance Metrics ──
-    let mut perf_map: std::collections::HashMap<String, Vec<crate::types::PerfMetrics>> = std::collections::HashMap::new();
-    for p in all_perf {
-        perf_map.entry(p.page_url.clone()).or_default().push(p);
-    }
-    let mut final_perf = Vec::new();
-    for (url, list) in perf_map {
-        let mut avg = crate::types::PerfMetrics { page_url: url, ..Default::default() };
-        let (mut fcp_sum, mut fcp_c) = (0.0, 0.0);
-        let (mut lcp_sum, mut lcp_c) = (0.0, 0.0);
-        let (mut tti_sum, mut tti_c) = (0.0, 0.0);
-        let (mut cls_sum, mut cls_c) = (0.0, 0.0);
-        let (mut dcl_sum, mut dcl_c) = (0.0, 0.0);
-        let (mut load_sum, mut load_c) = (0.0, 0.0);
-        for p in list {
-            if let Some(v) = p.fcp_ms { fcp_sum += v; fcp_c += 1.0; }
-            if let Some(v) = p.lcp_ms { lcp_sum += v; lcp_c += 1.0; }
-            if let Some(v) = p.tti_ms { tti_sum += v; tti_c += 1.0; }
-            if let Some(v) = p.cls_score { cls_sum += v; cls_c += 1.0; }
-            if let Some(v) = p.dom_content_loaded_ms { dcl_sum += v; dcl_c += 1.0; }
-            if let Some(v) = p.load_ms { load_sum += v; load_c += 1.0; }
-        }
-        if fcp_c > 0.0 { avg.fcp_ms = Some(fcp_sum / fcp_c); }
-        if lcp_c > 0.0 { avg.lcp_ms = Some(lcp_sum / lcp_c); }
-        if tti_c > 0.0 { avg.tti_ms = Some(tti_sum / tti_c); }
-        if cls_c > 0.0 { avg.cls_score = Some(cls_sum / cls_c); }
-        if dcl_c > 0.0 { avg.dom_content_loaded_ms = Some(dcl_sum / dcl_c); }
-        if load_c > 0.0 { avg.load_ms = Some(load_sum / load_c); }
-        final_perf.push(avg);
-    }
-    final_perf.sort_by(|a, b| a.page_url.cmp(&b.page_url));
-
-    // ── Average Network Stats ──
-    let mut net_map: std::collections::HashMap<String, Vec<crate::types::NetworkStats>> = std::collections::HashMap::new();
-    for n in all_network {
-        net_map.entry(n.page_url.clone()).or_default().push(n);
-    }
-    let mut final_net = Vec::new();
-    for (url, list) in net_map {
-        let mut avg = crate::types::NetworkStats { page_url: url, ..Default::default() };
-        let (mut dns_sum, mut dns_c) = (0.0, 0.0);
-        let (mut tcp_sum, mut tcp_c) = (0.0, 0.0);
-        let (mut tls_sum, mut tls_c) = (0.0, 0.0);
-        let (mut ttfb_sum, mut ttfb_c) = (0.0, 0.0);
-        let (mut dl_sum, mut dl_c) = (0.0, 0.0);
-        let mut max_res = 0;
-        let mut max_fail = 0;
-        let mut max_kb = 0.0;
-        let mut slowest_ms = 0.0;
-        let mut slowest_url = String::new();
-        let mut all_failed = Vec::new();
-        
-        for n in list {
-            if let Some(v) = n.dns_ms { dns_sum += v; dns_c += 1.0; }
-            if let Some(v) = n.tcp_connect_ms { tcp_sum += v; tcp_c += 1.0; }
-            if let Some(v) = n.tls_ms { tls_sum += v; tls_c += 1.0; }
-            if let Some(v) = n.ttfb_ms { ttfb_sum += v; ttfb_c += 1.0; }
-            if let Some(v) = n.download_ms { dl_sum += v; dl_c += 1.0; }
-            
-            if n.resource_count > max_res { max_res = n.resource_count; }
-            if n.failed_resource_count > max_fail { max_fail = n.failed_resource_count; }
-            if n.total_transfer_kb > max_kb { max_kb = n.total_transfer_kb; }
-            if let Some(sms) = n.slowest_resource_ms {
-                if sms > slowest_ms {
-                    slowest_ms = sms;
-                    slowest_url = n.slowest_resource_url.clone().unwrap_or_default();
-                }
-            }
-            all_failed.extend(n.failed_resource_urls);
-        }
-        
-        if dns_c > 0.0 { avg.dns_ms = Some(dns_sum / dns_c); }
-        if tcp_c > 0.0 { avg.tcp_connect_ms = Some(tcp_sum / tcp_c); }
-        if tls_c > 0.0 { avg.tls_ms = Some(tls_sum / tls_c); }
-        if ttfb_c > 0.0 { avg.ttfb_ms = Some(ttfb_sum / ttfb_c); }
-        if dl_c > 0.0 { avg.download_ms = Some(dl_sum / dl_c); }
-        
-        avg.resource_count = max_res;
-        avg.failed_resource_count = max_fail;
-        all_failed.sort();
-        all_failed.dedup();
-        avg.failed_resource_urls = all_failed;
-        avg.total_transfer_kb = max_kb;
-        if slowest_ms > 0.0 {
-            avg.slowest_resource_ms = Some(slowest_ms);
-            avg.slowest_resource_url = Some(slowest_url);
-        }
-        final_net.push(avg);
-    }
-    final_net.sort_by(|a, b| a.page_url.cmp(&b.page_url));
-
-    // ── Deduplicate Interactions ──
-    let mut inter_map: std::collections::HashMap<String, crate::types::PageInteractions> = std::collections::HashMap::new();
-    for i in all_interactions {
-        let entry = inter_map.entry(i.page_url.clone()).or_insert_with(|| i.clone());
-        if i.elements_found > entry.elements_found {
-            *entry = i;
-        }
-    }
-    let mut final_inter = inter_map.into_values().collect::<Vec<_>>();
-    final_inter.sort_by(|a, b| a.page_url.cmp(&b.page_url));
-    let total_elements: usize = final_inter.iter().map(|p| p.elements_found).sum();
-
-    // Merge crawled URLs into discovered so the set is a true superset
-    all_crawled.dedup();
     all_discovered_links.extend(all_crawled.clone());
     all_discovered_links.sort();
     all_discovered_links.dedup();
 
     println!(
-        "  {} Crawled {} page{}  │  {} interactive element{}  │  {} issue{}",
+        "  {} Crawled {} page{}  │  {} issue{}",
         style("✓").green().bold(),
         pages_visited,
         if pages_visited == 1 { "" } else { "s" },
-        total_elements,
-        if total_elements == 1 { "" } else { "s" },
         all_issues.len(),
         if all_issues.len() == 1 { "" } else { "s" }
     );
 
     Ok(CrawlResult {
         issues: all_issues,
-        perf_metrics: final_perf,
-        network_stats: final_net,
         stats: CrawlStats {
-            pages_visited: all_crawled.len(), // Use deduped count
+            pages_visited: all_crawled.len(),
             duration_secs: start.elapsed().as_secs_f64(),
-            elements_interacted: total_elements,
+            elements_interacted: 0, // not tracked in compact mode
             crawled_urls: all_crawled,
         },
         discovered_urls: all_discovered_links,
-        interactions: final_inter,
     })
 }
 
@@ -642,13 +501,9 @@ async fn audit_page(
     settle_ms: u64,
     discover: bool,
     link_selector: Option<&str>,
-) -> Result<(
-    Vec<Issue>,
-    PerfMetrics,
-    NetworkStats,
-    Vec<String>,
-    PageInteractions,
-)> {
+    pentest_enabled: bool,
+    http_client: &reqwest::Client,
+) -> Result<(Vec<Issue>, Vec<String>)> {
     // Navigate (ignore "soft" errors that still land on the page)
     let goto = tokio::time::timeout(Duration::from_secs(15), client.goto(url)).await;
     match goto {
@@ -748,6 +603,7 @@ async fn audit_page(
                 page_urls: vec![url.to_string()],
                 element: item["el"].as_str().map(|s| s.to_string()),
                 action_path: vec![],
+                affected_pages_count: None,
             });
         }
     }
@@ -785,6 +641,7 @@ async fn audit_page(
                 page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
+                affected_pages_count: None,
             });
         } else if fcp >= 1800.0 {
             page_issues.push(Issue {
@@ -794,6 +651,7 @@ async fn audit_page(
                 page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
+                affected_pages_count: None,
             });
         }
     }
@@ -806,6 +664,7 @@ async fn audit_page(
                 page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
+                affected_pages_count: None,
             });
         } else if lcp >= 2500.0 {
             page_issues.push(Issue {
@@ -815,6 +674,7 @@ async fn audit_page(
                 page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
+                affected_pages_count: None,
             });
         }
     }
@@ -827,6 +687,7 @@ async fn audit_page(
                 page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
+                affected_pages_count: None,
             });
         } else if tti >= 3800.0 {
             page_issues.push(Issue {
@@ -836,6 +697,7 @@ async fn audit_page(
                 page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
+                affected_pages_count: None,
             });
         }
     }
@@ -848,6 +710,7 @@ async fn audit_page(
                 page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
+                affected_pages_count: None,
             });
         } else if cls >= 0.1 {
             page_issues.push(Issue {
@@ -857,6 +720,7 @@ async fn audit_page(
                 page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
+                affected_pages_count: None,
             });
         }
     }
@@ -869,6 +733,7 @@ async fn audit_page(
                 page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
+                affected_pages_count: None,
             });
         } else if ld >= 2000.0 {
             page_issues.push(Issue {
@@ -878,6 +743,7 @@ async fn audit_page(
                 page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
+                affected_pages_count: None,
             });
         }
     }
@@ -916,6 +782,7 @@ async fn audit_page(
                 page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
+                affected_pages_count: None,
             });
         } else if ttfb >= 200.0 {
             page_issues.push(Issue {
@@ -925,6 +792,7 @@ async fn audit_page(
                 page_urls: vec![url.to_string()],
                 element: None,
                 action_path: vec![],
+                affected_pages_count: None,
             });
         }
     }
@@ -950,38 +818,23 @@ async fn audit_page(
             page_urls: vec![url.to_string()],
             element: None,
             action_path: vec![],
+            affected_pages_count: None,
         });
     }
 
     // ── Interactive elements ──────────────────────────────────────────────────
-    let mut elements: Vec<InteractiveElement> = Vec::new();
-    if let Some(arr) = v["interactive"].as_array() {
-        for item in arr {
-            let kind = item["kind"].as_str().unwrap_or("unknown").to_string();
-            let label = item["label"]
-                .as_str()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            let href = item["href"]
-                .as_str()
-                .map(|s| s.to_string())
-                .filter(|s| !s.is_empty() && !s.starts_with("javascript"));
-            let input_type = item["input_type"].as_str().map(|s| s.to_string());
-            elements.push(InteractiveElement {
-                kind,
-                label,
-                href,
-                input_type,
-            });
-        }
-    }
-    let page_interactions = PageInteractions {
-        page_url: url.to_string(),
-        elements_found: elements.len(),
-        elements,
-    };
+    // ── Pentest checks ─────────────────────────────────────────────────────
+    if pentest_enabled {
+        // Passive HTTP-based checks (headers, cookies, info disclosure)
+        let passive_issues = pentest::passive_checks(url, http_client).await;
+        page_issues.extend(passive_issues);
 
-    Ok((page_issues, perf, net, links, page_interactions))
+        // Active browser-based probes (SQLi, XSS, open redirect, dir traversal)
+        let active_issues = pentest::active_probes(client, url).await;
+        page_issues.extend(active_issues);
+    }
+
+    Ok((page_issues, links))
 }
 
 /// Build the async JS collection script for a given page.
@@ -1397,13 +1250,7 @@ async fn perform_login(
     settle_ms: u64,
     discover: bool,
     link_selector: Option<&str>,
-) -> Result<(
-    Vec<Issue>,
-    PerfMetrics,
-    NetworkStats,
-    Vec<String>,
-    PageInteractions,
-)> {
+) -> Result<(Vec<Issue>, Vec<String>)> {
     let login_url = match &auth.login_url {
         Some(u) if u.starts_with("http://") || u.starts_with("https://") => u.clone(),
         Some(path) if path.starts_with('/') => {
@@ -1428,6 +1275,7 @@ async fn perform_login(
         ),
         None => anyhow::bail!("No login URL provided"),
     };
+    let login_url = crate::types::normalize_url(&login_url);
 
     // Call audit_page on the login view directly. This handles .goto(), waits
     // for DOM ready, injects the JS collectors, and gathers interactive elements.
@@ -1444,6 +1292,11 @@ async fn perform_login(
         settle_ms,
         discover,
         link_selector,
+        false, // Skip pentest on login page (will be audited in main crawl)
+        &reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new()),
     )
     .await?;
 
@@ -1777,7 +1630,7 @@ async fn perform_login(
 
         if let Ok(current_url) = client.current_url().await {
             let current = current_url.as_str();
-            final_url = current.to_string();
+            final_url = crate::types::normalize_url(current);
 
             let url_indicates_login_page = Url::parse(current)
                 .ok()

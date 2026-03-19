@@ -25,6 +25,7 @@ reqwest = { version = "0.12", features = ["json", "gzip"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rmp-serde = "1.1"
 
 # Terminal output
 console = "0.15"

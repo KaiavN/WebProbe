@@ -109,12 +109,16 @@ pub struct Issue {
     pub severity: Severity,
     pub category: IssueCategory,
     pub message: String,
-    /// The page URLs where this was found
+    /// Sample of affected page URLs (truncated for compactness). See `affected_pages_count` for total.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub page_urls: Vec<String>,
+    /// Total number of unique pages affected (may exceed page_urls.len() if truncated)
+    #[serde(default)]
+    pub affected_pages_count: Option<usize>,
     /// The element selector or description that triggered this (if applicable)
     pub element: Option<String>,
-    /// The action path taken to reach this state
+    /// The action path taken to reach this state (not serialized to keep reports compact)
+    #[serde(skip)]
     pub action_path: Vec<String>,
 }
 
@@ -128,17 +132,19 @@ pub struct PageState {
     pub depth: usize,
 }
 
+pub fn normalize_url(raw: &str) -> String {
+    if raw.ends_with('/') && raw.len() > 1 && !raw.ends_with("://") {
+        raw.trim_end_matches('/').to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
 impl PageState {
     pub fn new(url: impl Into<String>) -> Self {
         let raw: String = url.into();
-        // Normalize trailing slash (except bare "/" or "scheme://host/")
-        let url = if raw.ends_with('/') && raw.len() > 1 && !raw.ends_with("://") {
-            raw.trim_end_matches('/').to_string()
-        } else {
-            raw
-        };
         Self {
-            url,
+            url: normalize_url(&raw),
             action_path: vec![],
             depth: 0,
         }
@@ -146,21 +152,15 @@ impl PageState {
 
     /// Fingerprint used for deduplication
     pub fn fingerprint(&self) -> String {
-        // Normalize URL: strip trailing slash (except root /)
-        let norm_url =
-            if self.url.ends_with('/') && self.url.len() > 1 && !self.url.ends_with("://") {
-                self.url.trim_end_matches('/').to_string()
-            } else {
-                self.url.clone()
-            };
-        norm_url
+        normalize_url(&self.url)
     }
 
     pub fn child(&self, url: impl Into<String>, action: &str) -> Self {
         let mut new_path = self.action_path.clone();
         new_path.push(action.to_string());
+        let raw_url: String = url.into();
         Self {
-            url: url.into(),
+            url: normalize_url(&raw_url),
             action_path: new_path,
             depth: self.depth + 1,
         }
@@ -364,6 +364,56 @@ impl Report {
     }
 }
 
+/// Deduplicate issues by merging duplicates (same severity, category, message, element).
+/// Aggregates page_urls and clears action_path to reduce report size.
+/// Also sets `affected_pages_count` and truncates `page_urls` to a maximum to keep JSON compact.
+pub fn deduplicate_issues(issues: Vec<Issue>, max_pages_per_issue: usize) -> Vec<Issue> {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<(Severity, IssueCategory, String, Option<String>), Vec<Issue>> =
+        BTreeMap::new();
+    for issue in issues {
+        groups
+            .entry((
+                issue.severity.clone(),
+                issue.category.clone(),
+                issue.message.clone(),
+                issue.element.clone(),
+            ))
+            .or_default()
+            .push(issue);
+    }
+    let mut result = Vec::new();
+    for (_, group) in groups {
+        // Combine all page_urls from the group
+        let mut all_urls = Vec::new();
+        for issue in &group {
+            all_urls.extend(issue.page_urls.iter().cloned());
+        }
+        all_urls.sort();
+        all_urls.dedup();
+        let total_count = all_urls.len();
+        // Truncate to max_pages_per_issue to keep JSON size manageable
+        if all_urls.len() > max_pages_per_issue {
+            all_urls.truncate(max_pages_per_issue);
+        }
+        // Use the first issue as a template; clear action_path and set combined URLs
+        let mut base = group.into_iter().next().unwrap();
+        base.page_urls = all_urls;
+        base.affected_pages_count = Some(total_count);
+        base.action_path = Vec::new();
+        result.push(base);
+    }
+    // Sort: severity descending, then by number of affected pages
+    result.sort_by(|a, b| {
+        let sev = b.severity.cmp(&a.severity);
+        if !sev.is_eq() {
+            return sev;
+        }
+        b.affected_pages_count.cmp(&a.affected_pages_count)
+    });
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,5 +441,103 @@ mod tests {
         assert_eq!(PageState::new("http://example.com/").fingerprint(), "http://example.com");
         assert_eq!(PageState::new("http://example.com/path").fingerprint(), "http://example.com/path");
         assert_eq!(PageState::new("http://example.com/path/").fingerprint(), "http://example.com/path");
+    }
+
+    #[test]
+    fn test_deduplicate_issues() {
+        let issue1 = Issue {
+            severity: Severity::Error,
+            category: IssueCategory::ConsoleError,
+            message: "Uncaught TypeError".to_string(),
+            page_urls: vec![
+                "http://localhost/".to_string(),
+                "http://localhost/page1".to_string(),
+            ],
+            element: Some("#root".to_string()),
+            action_path: vec!["click".to_string()],
+            affected_pages_count: None,
+        };
+        let issue2 = Issue {
+            severity: Severity::Error,
+            category: IssueCategory::ConsoleError,
+            message: "Uncaught TypeError".to_string(),
+            page_urls: vec!["http://localhost/page2".to_string()],
+            element: Some("#root".to_string()),
+            action_path: vec!["link".to_string()],
+            affected_pages_count: None,
+        };
+        let issue3 = Issue {
+            severity: Severity::Warning,
+            category: IssueCategory::Performance,
+            message: "Slow resource".to_string(),
+            page_urls: vec!["http://localhost/".to_string()],
+            element: None,
+            action_path: vec![],
+            affected_pages_count: None,
+        };
+        let input = vec![issue1.clone(), issue2, issue3, issue1.clone()]; // includes Error and Warning
+        let result = deduplicate_issues(input, 100);
+
+        assert_eq!(result.len(), 2);
+
+        // Error group should have combined page URLs
+        let error_issue = result
+            .iter()
+            .find(|i| matches!(i.severity, Severity::Error))
+            .unwrap();
+        assert_eq!(error_issue.message, "Uncaught TypeError");
+        assert_eq!(error_issue.category, IssueCategory::ConsoleError);
+        assert_eq!(error_issue.element, Some("#root".to_string()));
+        let mut urls = error_issue.page_urls.clone();
+        urls.sort();
+        assert_eq!(
+            urls,
+            vec![
+                "http://localhost/".to_string(),
+                "http://localhost/page1".to_string(),
+                "http://localhost/page2".to_string()
+            ]
+        );
+        assert!(error_issue.action_path.is_empty());
+
+        // Warning issue unchanged
+        let warning_issue = result
+            .iter()
+            .find(|i| matches!(i.severity, Severity::Warning))
+            .unwrap();
+        assert_eq!(warning_issue.message, "Slow resource");
+        assert_eq!(warning_issue.page_urls, vec!["http://localhost/".to_string()]);
+        assert!(warning_issue.action_path.is_empty());
+    }
+
+    #[test]
+    fn test_deduplicate_issues_truncates_large_url_sets() {
+        // Create an issue that appears on 150 pages
+        let mut many_urls = Vec::new();
+        for i in 0..150 {
+            many_urls.push(format!("http://localhost/page{}", i));
+        }
+        let issue = Issue {
+            severity: Severity::Warning,
+            category: IssueCategory::ConsoleError,
+            message: "Many pages".to_string(),
+            page_urls: many_urls.clone(),
+            element: None,
+            action_path: vec![],
+            affected_pages_count: None,
+        };
+        let result = deduplicate_issues(vec![issue], 100);
+
+        assert_eq!(result.len(), 1);
+        let deduped = &result[0];
+        // Should be truncated to MAX_PAGES_PER_ISSUE (100)
+        assert_eq!(deduped.page_urls.len(), 100);
+        // But total count should be 150
+        assert_eq!(deduped.affected_pages_count, Some(150));
+        // The sample should be first 100 alphabetically after sort/dedup
+        let mut expected_sample = many_urls;
+        expected_sample.sort();
+        expected_sample.truncate(100);
+        assert_eq!(deduped.page_urls, expected_sample);
     }
 }

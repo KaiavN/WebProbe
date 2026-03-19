@@ -9,9 +9,13 @@ use chrono::Local;
 use clap::{Parser, Subcommand};
 use console::style;
 use profiles::{AuthProfile, ProfileStore};
+use std::ffi::OsStr;
+use std::fs;
 use std::io::{self, Write};
+use std::mem;
+use std::path::Path;
 use std::path::PathBuf;
-use types::{AuthConfig, Report};
+use types::{AuthConfig, Issue, IssueCategory, Report, Severity, deduplicate_issues};
 
 /// webprobe — Exhaustive web crawler & load tester for localhost SPAs
 ///
@@ -79,7 +83,7 @@ enum Commands {
         #[arg(short, long, default_value_t = 10)]
         depth: usize,
 
-        /// Path to write the JSON report (default: report-YYYYMMDD-HHMMSS.json)
+        /// Path to write the report (default: report-YYYYMMDD-HHMMSS with .json or .msgpack)
         #[arg(short, long)]
         output: Option<PathBuf>,
 
@@ -92,7 +96,7 @@ enum Commands {
         duration: u64,
 
         /// Number of concurrent browser tabs for crawling
-        #[arg(short = 'c', long, default_value_t = 1)]
+        #[arg(short = 'c', long, default_value_t = 4)]
         concurrency: usize,
 
         /// Run browser in headed (visible) mode
@@ -106,6 +110,16 @@ enum Commands {
         /// Skip the load test phase
         #[arg(long)]
         no_load: bool,
+
+        /// Increase verbosity (show info-level issues, more page samples)
+        #[arg(long, short = 'v')]
+        verbose: bool,
+
+        /// Write three separate report files: (basename).crawl.json (crawl issues),
+        /// (basename).pentest.json (security issues only), and (basename).load.json
+        /// (load test). The combined report is still printed to the console.
+        #[arg(long)]
+        separate_reports: bool,
 
         // ── Auth ──────────────────────────────────────────────────────────────
         /// Login page path or URL — triggers form-based auth before crawling
@@ -148,6 +162,13 @@ enum Commands {
         #[arg(long, value_name = "FILE")]
         cookies: Option<PathBuf>,
 
+        /// Disable penetration testing checks (enabled by default).
+        /// Run comprehensive security audit: security headers, cookie security, CORS,
+        /// CSRF, JWT analysis, IDOR, SQL injection, XSS, open redirect, directory
+        /// traversal, SSTI, SSRF, file upload risks, and mixed content detection.
+        #[arg(long)]
+        no_pentest: bool,
+
         /// URL paths to skip, comma-separated (each must start with /).
         /// The crawler will not visit — or follow any link to — any of these paths.
         /// Example: --skip /admin,/logout
@@ -164,6 +185,10 @@ enum Commands {
         /// Run `webprobe profile list` to see saved profiles.
         #[arg(long, value_name = "NAME")]
         profile: Option<String>,
+
+        /// Output format for the report: json (default) or msgpack (smaller binary)
+        #[arg(long, default_value = "msgpack")]
+        format: String,
     },
 
     /// Run a standalone load test
@@ -179,9 +204,13 @@ enum Commands {
         #[arg(short, long, default_value_t = 30)]
         duration: u64,
 
-        /// Path to write the JSON report (default: load-YYYYMMDD-HHMMSS.json)
+        /// Path to write the report (default: load-YYYYMMDD-HHMMSS with .json or .msgpack)
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Output format: json or msgpack (default: msgpack)
+        #[arg(long, default_value = "msgpack")]
+        format: String,
     },
 
     /// Manage saved authentication profiles
@@ -244,13 +273,33 @@ fn parse_skip_paths(input: &str) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    Json,
+    Msgpack,
+}
+
+impl OutputFormat {
+    fn parse(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "json" => Ok(OutputFormat::Json),
+            "msgpack" => Ok(OutputFormat::Msgpack),
+            _ => anyhow::bail!("Unsupported output format: {}. Use 'json' or 'msgpack'.", s),
+        }
+    }
+}
+
 /// Return `path` if given, otherwise generate a unique timestamped filename.
-fn resolve_output(path: Option<PathBuf>, prefix: &str) -> PathBuf {
+fn resolve_output(path: Option<PathBuf>, prefix: &str, format: OutputFormat) -> PathBuf {
     if let Some(p) = path {
         return p;
     }
     let ts = Local::now().format("%Y%m%d-%H%M%S");
-    PathBuf::from(format!("{}-{}.json", prefix, ts))
+    let ext = match format {
+        OutputFormat::Json => "json",
+        OutputFormat::Msgpack => "msgpack",
+    };
+    PathBuf::from(format!("{}-{}.{}", prefix, ts, ext))
 }
 
 #[tokio::main]
@@ -268,6 +317,8 @@ async fn main() -> Result<()> {
             headed,
             wait_ms,
             no_load,
+            verbose,
+            separate_reports,
             auth_url,
             auth_username,
             auth_password,
@@ -275,12 +326,16 @@ async fn main() -> Result<()> {
             auth_password_selector,
             auth_submit_selector,
             cookies,
+            no_pentest,
             skip,
             selector,
             profile,
+            format,
         } => {
             let url = normalize_url(&url);
-            let output = resolve_output(output, "report");
+            let format_enum = OutputFormat::parse(&format)?;
+            let explicit_output = output.clone();
+            let output = resolve_output(output, "report", format_enum);
 
             // ── Skip paths ────────────────────────────────────────────────────
             let skip_paths: Vec<String> = match skip {
@@ -856,48 +911,24 @@ async fn main() -> Result<()> {
                 auth,
                 skip_paths,
                 link_selector: selector,
+                pentest: !no_pentest,
             };
 
             let crawl_result = crawler::run_crawler(crawler_config).await?;
 
             let mut report = Report::new(&url);
             report.issues = crawl_result.issues;
+            // Deduplicate issues, truncate page samples, and filter by severity
+            let max_pages = if verbose { 100 } else { 20 };
+            report.issues = deduplicate_issues(report.issues, max_pages);
+            // Exclude info-level issues unless verbose
+            if !verbose {
+                report.issues.retain(|issue| issue.severity >= Severity::Warning);
+            }
             report.crawl_stats = crawl_result.stats;
-            
-            // Group perf, net, and interaction stats into PageReports
-            let mut page_reports: std::collections::BTreeMap<String, crate::types::PageReport> = std::collections::BTreeMap::new();
-            
-            for perf in crawl_result.perf_metrics {
-                let entry = page_reports.entry(perf.page_url.clone()).or_insert_with(|| crate::types::PageReport {
-                    url: perf.page_url.clone(),
-                    perf_metrics: None,
-                    network_stats: None,
-                    interactions: None,
-                });
-                entry.perf_metrics = Some(perf);
-            }
-            
-            for net in crawl_result.network_stats {
-                let entry = page_reports.entry(net.page_url.clone()).or_insert_with(|| crate::types::PageReport {
-                    url: net.page_url.clone(),
-                    perf_metrics: None,
-                    network_stats: None,
-                    interactions: None,
-                });
-                entry.network_stats = Some(net);
-            }
-            
-            for inter in crawl_result.interactions {
-                let entry = page_reports.entry(inter.page_url.clone()).or_insert_with(|| crate::types::PageReport {
-                    url: inter.page_url.clone(),
-                    perf_metrics: None,
-                    network_stats: None,
-                    interactions: None,
-                });
-                entry.interactions = Some(inter);
-            }
-            
-            report.pages = page_reports.into_values().collect();
+
+            // Skip collecting per-page performance, network, and interaction details
+            // to keep the JSON report compact. Only essential stats and issues are retained.
 
             let discovered = {
                 let mut urls = crawl_result.discovered_urls;
@@ -936,14 +967,127 @@ async fn main() -> Result<()> {
             }
 
             report.compute_summary();
-            reporter::console::print_report(&report);
 
-            reporter::json::write_report(&report, &output)?;
-            println!(
-                "  {} Report saved to {}\n",
-                style("✓").green(),
-                style(output.display()).underlined()
-            );
+            if separate_reports {
+                // Print combined report to console (same as non-separate mode)
+                let console_output = reporter::console::format_report(&report);
+                println!("{}", console_output);
+
+                // Separate issues by category: Security issues (pentest) vs others (crawl)
+                let (crawl_issues, pentest_issues): (Vec<Issue>, Vec<Issue>) = report.issues
+                    .into_iter()
+                    .partition(|issue| issue.category != IssueCategory::Security);
+
+                // ── Build crawl report ──
+                let mut crawl_report = Report::new(&url);
+                crawl_report.issues = crawl_issues;
+                crawl_report.crawl_stats = mem::take(&mut report.crawl_stats);
+                crawl_report.discovered_urls = mem::take(&mut report.discovered_urls);
+                crawl_report.compute_summary();
+                // Remove verbose data to keep compact
+                crawl_report.crawl_stats.crawled_urls.clear();
+                crawl_report.discovered_urls.clear();
+
+                // ── Build pentest report ──
+                let mut pentest_report = Report::new(&url);
+                pentest_report.issues = pentest_issues;
+                pentest_report.compute_summary();
+
+                // ── Determine output paths ──
+                // Helper to generate path: if user provided output, insert type before extension; else use timestamped prefix
+                let get_output_path = |suffix: &str| -> PathBuf {
+                    if let Some(ref p) = explicit_output {
+                        // Insert suffix before extension: e.g., /path/report.json -> /path/report.crawl.json
+                        let parent = p.parent().unwrap_or_else(|| Path::new("."));
+                        let stem = p.file_stem()
+                            .and_then(|s: &OsStr| s.to_str())
+                            .unwrap_or("report");
+                        let ext = p.extension()
+                            .and_then(|s: &OsStr| s.to_str())
+                            .unwrap_or_else(|| match format_enum {
+                                OutputFormat::Json => "json",
+                                OutputFormat::Msgpack => "msgpack",
+                            });
+                        parent.join(format!("{}.{}.{}", stem, suffix, ext))
+                    } else {
+                        resolve_output(None, suffix, format_enum)
+                    }
+                };
+
+                let crawl_path = get_output_path("crawl");
+                let pentest_path = get_output_path("pentest");
+
+                // ── Write crawl report ──
+                match format_enum {
+                    OutputFormat::Json => reporter::json::write_report(&crawl_report, &crawl_path)?,
+                    OutputFormat::Msgpack => reporter::msgpack::write_report(&crawl_report, &crawl_path)?,
+                }
+                let crawl_txt = crawl_path.with_extension("txt");
+                fs::write(&crawl_txt, reporter::console::format_report(&crawl_report))?;
+
+                // ── Write pentest report ──
+                match format_enum {
+                    OutputFormat::Json => reporter::json::write_report(&pentest_report, &pentest_path)?,
+                    OutputFormat::Msgpack => reporter::msgpack::write_report(&pentest_report, &pentest_path)?,
+                }
+                let pentest_txt = pentest_path.with_extension("txt");
+                fs::write(&pentest_txt, reporter::console::format_report(&pentest_report))?;
+
+                // ── Load report (if present) ──
+                if report.load_test.is_some() {
+                    let mut load_report = Report::new(&url);
+                    let load_test = report.load_test.take().unwrap();
+                    load_report.load_test = Some(load_test);
+                    load_report.compute_summary();
+                    let load_path = get_output_path("load");
+                    match format_enum {
+                        OutputFormat::Json => reporter::json::write_report(&load_report, &load_path)?,
+                        OutputFormat::Msgpack => reporter::msgpack::write_report(&load_report, &load_path)?,
+                    }
+                    let load_txt = load_path.with_extension("txt");
+                    fs::write(&load_txt, reporter::console::format_report(&load_report))?;
+
+                    println!(
+                        "  {} Separate reports saved to:\n     {} (crawl)\n     {} (pentest)\n     {} (load)",
+                        style("✓").green(),
+                        style(crawl_path.display()).underlined(),
+                        style(pentest_path.display()).underlined(),
+                        style(load_path.display()).underlined()
+                    );
+                } else {
+                    println!(
+                        "  {} Separate reports saved to:\n     {} (crawl)\n     {} (pentest)",
+                        style("✓").green(),
+                        style(crawl_path.display()).underlined(),
+                        style(pentest_path.display()).underlined()
+                    );
+                }
+            } else {
+                // Remove verbose data to keep reports compact
+                report.crawl_stats.crawled_urls.clear();
+                report.discovered_urls.clear();
+
+                // Generate compact console output
+                let console_output = reporter::console::format_report(&report);
+                println!("{}", console_output);
+
+                // Write report in selected format
+                match format_enum {
+                    OutputFormat::Json => reporter::json::write_report(&report, &output)?,
+                    OutputFormat::Msgpack => reporter::msgpack::write_report(&report, &output)?,
+                }
+
+                // Write TXT report (same basename, .txt extension)
+                let txt_path = output.with_extension("txt");
+                fs::write(&txt_path, &console_output)?;
+
+                println!(
+                    "  {} Reports saved to {} and {}\n",
+                    style("✓").green(),
+                    style(output.display()).underlined(),
+                    style(txt_path.display()).underlined()
+                );
+            }
         }
 
         Commands::Load {
@@ -951,9 +1095,11 @@ async fn main() -> Result<()> {
             users,
             duration,
             output,
+            format,
         } => {
             let url = normalize_url(&url);
-            let output = resolve_output(output, "load");
+            let format_enum = OutputFormat::parse(&format)?;
+            let output = resolve_output(output, "load", format_enum);
 
             println!(
                 "\n  {} Load testing {} ({} user{}, {}s)\n",
@@ -974,13 +1120,30 @@ async fn main() -> Result<()> {
             let mut report = Report::new(&url);
             report.load_test = Some(load_result);
             report.compute_summary();
-            reporter::console::print_report(&report);
 
-            reporter::json::write_report(&report, &output)?;
+            // Remove verbose data to keep reports compact
+            report.crawl_stats.crawled_urls.clear();
+            report.discovered_urls.clear();
+
+            // Generate compact console output
+            let console_output = reporter::console::format_report(&report);
+            println!("{}", console_output);
+
+            // Write report in selected format
+            match format_enum {
+                OutputFormat::Json => reporter::json::write_report(&report, &output)?,
+                OutputFormat::Msgpack => reporter::msgpack::write_report(&report, &output)?,
+            }
+
+            // Write TXT report (same basename, .txt extension)
+            let txt_path = output.with_extension("txt");
+            fs::write(&txt_path, &console_output)?;
+
             println!(
-                "  {} Report saved to {}\n",
+                "  {} Reports saved to {} and {}\n",
                 style("✓").green(),
-                style(output.display()).underlined()
+                style(output.display()).underlined(),
+                style(txt_path.display()).underlined()
             );
         }
 
