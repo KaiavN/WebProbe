@@ -189,6 +189,26 @@ enum Commands {
         /// Output format for the report: json (default) or msgpack (smaller binary)
         #[arg(long, default_value = "msgpack")]
         format: String,
+
+        /// Minimum severity level to include in the report (info, warning, error, critical).
+        /// Defaults to "info" (all issues included). Higher levels exclude lower severities.
+        #[arg(long, default_value = "info")]
+        min_severity: String,
+
+        /// Maximum number of discovered URLs to include in the report (default: unlimited).
+        /// Truncates the discovered_urls list to prevent huge files on large sites.
+        #[arg(long)]
+        max_discovered: Option<usize>,
+
+        /// Maximum number of page URL samples to include per issue (default: 20, or 100 with --verbose).
+        /// Overrides the default truncation when specified.
+        #[arg(long)]
+        max_issue_urls: Option<usize>,
+
+        /// Maximum total number of issues to include in the report (default: unlimited).
+        /// Issues are sorted by severity and impact, so the most important are kept.
+        #[arg(long)]
+        max_total_issues: Option<usize>,
     },
 
     /// Run a standalone load test
@@ -289,6 +309,19 @@ impl OutputFormat {
     }
 }
 
+/// Parse severity level from string (info, warning, error, critical)
+fn parse_severity(s: &str) -> Result<Severity> {
+    match s.to_lowercase().as_str() {
+        "info" => Ok(Severity::Info),
+        "warning" => Ok(Severity::Warning),
+        "warn" => Ok(Severity::Warning),
+        "error" => Ok(Severity::Error),
+        "critical" => Ok(Severity::Critical),
+        "crit" => Ok(Severity::Critical),
+        _ => anyhow::bail!("Invalid severity '{}'. Use: info, warning, error, critical", s),
+    }
+}
+
 /// Return `path` if given, otherwise generate a unique timestamped filename.
 fn resolve_output(path: Option<PathBuf>, prefix: &str, format: OutputFormat) -> PathBuf {
     if let Some(p) = path {
@@ -331,6 +364,10 @@ async fn main() -> Result<()> {
             selector,
             profile,
             format,
+            min_severity,
+            max_discovered,
+            max_issue_urls,
+            max_total_issues,
         } => {
             let url = normalize_url(&url);
             let format_enum = OutputFormat::parse(&format)?;
@@ -918,13 +955,22 @@ async fn main() -> Result<()> {
 
             let mut report = Report::new(&url);
             report.issues = crawl_result.issues;
-            // Deduplicate issues, truncate page samples, and filter by severity
-            let max_pages = if verbose { 100 } else { 20 };
-            report.issues = deduplicate_issues(report.issues, max_pages);
-            // Exclude info-level issues unless verbose
-            if !verbose {
-                report.issues.retain(|issue| issue.severity >= Severity::Warning);
+
+            // Determine max_pages for issue URL samples
+            let max_pages_for_issues = max_issue_urls.unwrap_or_else(|| if verbose { 100 } else { 20 });
+
+            // Deduplicate issues (merges duplicates, truncates page samples)
+            report.issues = deduplicate_issues(report.issues, max_pages_for_issues);
+
+            // Filter by minimum severity level
+            let min_sev = parse_severity(&min_severity)?;
+            report.issues.retain(|issue| issue.severity >= min_sev);
+
+            // Apply total issue limit if specified (keeps most severe due to deduplication sorting)
+            if let Some(limit) = max_total_issues {
+                report.issues.truncate(limit);
             }
+
             report.crawl_stats = crawl_result.stats;
 
             // Skip collecting per-page performance, network, and interaction details
@@ -937,6 +983,12 @@ async fn main() -> Result<()> {
                 urls
             };
             report.discovered_urls = discovered.clone();
+
+            // Apply max_discovered limit if specified (truncate both lists)
+            if let Some(limit) = max_discovered {
+                report.discovered_urls.truncate(limit);
+                report.crawl_stats.crawled_urls.truncate(limit);
+            }
 
             if !no_load && users > 0 {
                 let load_urls = if discovered.is_empty() {
