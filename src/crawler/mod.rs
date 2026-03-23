@@ -42,6 +42,7 @@ pub struct CrawlResult {
     pub issues: Vec<Issue>,
     pub stats: CrawlStats,
     pub discovered_urls: Vec<String>,
+    pub captured_auth: Option<AuthConfig>,
 }
 
 /// Open a browser session — capabilities differ between Firefox, Chrome, and Safari.
@@ -190,69 +191,129 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
     let mut post_login_url: Option<String> = None;
     let mut login_discovered_links = Vec::new();
     let mut login_url_for_stats = String::new();
+    let mut captured_auth: Option<AuthConfig> = None;
 
     if config.auth.login_url.is_some() {
-        print!("  {} Authenticating… ", style("→").cyan());
         use std::io::Write;
-        std::io::stdout().flush().ok();
-        match perform_login(
-            &sessions[0],
-            &config.auth,
-            &config.start_url,
-            config.settle_ms,
-            true,
-            config.link_selector.as_deref(),
-        )
-        .await
-        {
-            Ok((issues, links)) => {
-                println!("{}", style("ok").green().bold());
-                // Record the post-login URL so we can seed it into the BFS below.
-                // After a successful login the browser is usually on the dashboard/home
-                // page, which may be a different route than start_url.
-                if let Ok(landed) = sessions[0].current_url().await {
-                    let landed_str = crate::types::normalize_url(landed.as_str());
-                    login_url_for_stats = landed_str.clone(); // The URL we are auditing
-                    let norm_landed = landed_str.clone();
-                    let norm_start = crate::types::normalize_url(&config.start_url);
-                    if norm_landed != norm_start {
-                        post_login_url = Some(landed_str);
+        
+        let is_manual = config.auth.username.is_none() && config.auth.password.is_none();
+        
+        if is_manual {
+            let login_url = match &config.auth.login_url {
+                Some(u) if u.starts_with("http://") || u.starts_with("https://") => u.clone(),
+                Some(path) if path.starts_with('/') => {
+                    let base = Url::parse(&config.start_url).unwrap_or_else(|_| Url::parse("http://localhost").unwrap());
+                    let mut origin = format!("{}://{}", base.scheme(), base.host_str().unwrap_or("localhost"));
+                    if let Some(port) = base.port() {
+                        origin.push_str(&format!(":{}", port));
                     }
+                    format!("{}{}", origin, path)
                 }
-                login_discovered_links = links;
-                // Replicate auth cookies from sessions[0] to all other sessions so that
-                // every concurrent worker crawls as the authenticated user.
-                if sessions.len() > 1 {
-                    if let Ok(cookies) = sessions[0].get_all_cookies().await {
-                        for sess in sessions.iter().skip(1) {
-                            // Must be on the target domain before adding cookies.
-                            sess.goto(&config.start_url).await.ok();
-                            wait_for_dom_ready(sess, Duration::from_secs(5)).await;
-                            for c in &cookies {
-                                sess.add_cookie(c.clone()).await.ok();
+                Some(path) => format!("{}/{}", config.start_url.trim_end_matches('/'), path.trim_start_matches('/')),
+                None => config.start_url.clone(),
+            };
+            
+            std::io::stdout().flush().ok();
+            match perform_manual_login(
+                &sessions[0],
+                &login_url,
+                config.settle_ms,
+            )
+            .await
+            {
+                Ok((issues, links, captured)) => {
+                    captured_auth = Some(captured);
+                    println!("{}", style("✓").green().bold());
+                    
+                    if let Ok(landed) = sessions[0].current_url().await {
+                        let landed_str = crate::types::normalize_url(landed.as_str());
+                        login_url_for_stats = landed_str.clone();
+                        let norm_landed = landed_str.clone();
+                        let norm_start = crate::types::normalize_url(&config.start_url);
+                        if norm_landed != norm_start {
+                            post_login_url = Some(landed_str);
+                        }
+                    }
+                    login_discovered_links = links;
+                    
+                    if sessions.len() > 1 {
+                        if let Ok(cookies) = sessions[0].get_all_cookies().await {
+                            for sess in sessions.iter().skip(1) {
+                                sess.goto(&config.start_url).await.ok();
+                                wait_for_dom_ready(sess, Duration::from_secs(5)).await;
+                                for c in &cookies {
+                                    sess.add_cookie(c.clone()).await.ok();
+                                }
                             }
                         }
                     }
+                    
+                    if let Ok(mut g) = all_issues.lock() {
+                        g.extend(issues);
+                    }
+                    if let Ok(mut g) = all_crawled.lock() {
+                        g.push(login_url_for_stats.clone());
+                    }
                 }
-
-                // Add the login page data to global crawler stats
-                if let Ok(mut g) = all_issues.lock() {
-                    g.extend(issues);
-                }
-                // Use the initial login_url (or current url) for crawled stats
-                if let Ok(mut g) = all_crawled.lock() {
-                    g.push(login_url_for_stats.clone());
+                Err(e) => {
+                    println!("{}", style("failed").red().bold());
+                    eprintln!("  {} Manual login failed: {}", style("⚠").red().bold(), e);
+                    anyhow::bail!("Manual login failed");
                 }
             }
-            Err(e) => {
-                println!("{}", style("failed").red().bold());
-                eprintln!("  {} Login failed: {}", style("⚠").red().bold(), e);
-                eprintln!("  {} The crawl has been aborted.", style("│").red().dim());
-                eprintln!(
-                    "  {} Check that your credentials and selectors are correct.",
-                    style("│").red().dim()
-                );
-                anyhow::bail!("Login failed");
+        } else {
+            print!("  {} Authenticating… ", style("→").cyan());
+            std::io::stdout().flush().ok();
+            match perform_login(
+                &sessions[0],
+                &config.auth,
+                &config.start_url,
+                config.settle_ms,
+                true,
+                config.link_selector.as_deref(),
+            )
+            .await
+            {
+                Ok((issues, links)) => {
+                    println!("{}", style("ok").green().bold());
+                    if let Ok(landed) = sessions[0].current_url().await {
+                        let landed_str = crate::types::normalize_url(landed.as_str());
+                        login_url_for_stats = landed_str.clone();
+                        let norm_landed = landed_str.clone();
+                        let norm_start = crate::types::normalize_url(&config.start_url);
+                        if norm_landed != norm_start {
+                            post_login_url = Some(landed_str);
+                        }
+                    }
+                    login_discovered_links = links;
+                    if sessions.len() > 1 {
+                        if let Ok(cookies) = sessions[0].get_all_cookies().await {
+                            for sess in sessions.iter().skip(1) {
+                                sess.goto(&config.start_url).await.ok();
+                                wait_for_dom_ready(sess, Duration::from_secs(5)).await;
+                                for c in &cookies {
+                                    sess.add_cookie(c.clone()).await.ok();
+                                }
+                            }
+                        }
+                    }
+                    if let Ok(mut g) = all_issues.lock() {
+                        g.extend(issues);
+                    }
+                    if let Ok(mut g) = all_crawled.lock() {
+                        g.push(login_url_for_stats.clone());
+                    }
+                }
+                Err(e) => {
+                    println!("{}", style("failed").red().bold());
+                    eprintln!("  {} Login failed: {}", style("⚠").red().bold(), e);
+                    eprintln!("  {} The crawl has been aborted.", style("│").red().dim());
+                    eprintln!(
+                        "  {} Check that your credentials and selectors are correct.",
+                        style("│").red().dim()
+                    );
+                    anyhow::bail!("Login failed");
+                }
             }
         }
     }
@@ -486,6 +547,7 @@ pub async fn run_crawler(config: CrawlerConfig) -> Result<CrawlResult> {
             crawled_urls: all_crawled,
         },
         discovered_urls: all_discovered_links,
+        captured_auth,
     })
 }
 
@@ -504,10 +566,10 @@ async fn audit_page(
     pentest_enabled: bool,
     http_client: &reqwest::Client,
 ) -> Result<(Vec<Issue>, Vec<String>)> {
-    // Navigate (ignore "soft" errors that still land on the page)
+    // Navigate with improved timeout message
     let goto = tokio::time::timeout(Duration::from_secs(15), client.goto(url)).await;
     match goto {
-        Err(_) => anyhow::bail!("goto timed out after 15s"),
+        Err(_) => anyhow::bail!("Page load timed out after 15s. The server may be slow or unresponsive."),
         Ok(Err(e)) => {
             let msg = e.to_string();
             if msg.contains("net::ERR_CONNECTION_REFUSED")
@@ -520,7 +582,7 @@ async fn audit_page(
         Ok(Ok(())) => {}
     }
 
-    wait_for_dom_ready(client, Duration::from_secs(5)).await;
+    wait_for_dom_ready(client, Duration::from_secs(3)).await;
 
     // Inject error listeners immediately after DOM ready, before the settle
     // delay, so we capture any errors that fire during JS hydration.
@@ -1153,8 +1215,10 @@ fn build_collect_js(base_host: &str, discover: bool, link_selector: Option<&str>
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Poll `document.readyState` until complete/interactive or timeout.
+/// Uses quick initial poll with exponential backoff for faster detection.
 async fn wait_for_dom_ready(client: &Client, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut delay_ms = 20u64;
     loop {
         if tokio::time::Instant::now() >= deadline {
             break;
@@ -1167,7 +1231,10 @@ async fn wait_for_dom_ready(client: &Client, timeout: Duration) {
 
         match state.as_deref() {
             Some("complete") | Some("interactive") => break,
-            _ => tokio::time::sleep(Duration::from_millis(80)).await,
+            _ => {
+                delay_ms = (delay_ms * 3 / 2).min(100);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
         }
     }
 }
@@ -1238,6 +1305,328 @@ async fn find_first(client: &Client, selectors: &[&str]) -> Option<fantoccini::e
         }
     }
     None
+}
+
+/// Perform manual login - opens browser for user to log in, then captures credentials/selectors.
+async fn perform_manual_login(
+    client: &Client,
+    base_url: &str,
+    settle_ms: u64,
+) -> Result<(Vec<Issue>, Vec<String>, AuthConfig)> {
+    use std::io::Write;
+    use std::time::Duration;
+
+    let login_url = base_url;
+    let login_url_str = login_url.to_string();
+    let mut final_url_str = String::new();
+    let mut captured_auth: AuthConfig = AuthConfig {
+        login_url: None,
+        username: None,
+        password: None,
+        username_selector: None,
+        password_selector: None,
+        submit_selector: None,
+        cookies_file: None,
+    };
+
+    // Allow retry if login fails
+    for attempt in 1..=3 {
+        let current_login_success;
+        println!();
+        if attempt > 1 {
+            println!("  {} Login attempt {}/2", style("↻").yellow(), attempt);
+        }
+        println!("  {} {}", style("◆").cyan().bold(), style("Manual Login").bold());
+        println!();
+        println!("  {}  1. Browser opened at login page", style("→").cyan());
+        println!("  {}  2. Complete login (credentials, 2FA, etc.)", style("→").cyan());
+        println!("  {}  3. Wait for page to fully load", style("→").cyan());
+        println!("  {}  4. Press {} to continue", style("→").cyan(), style("Enter").yellow());
+        println!();
+        println!("  {}  Tip: Don't close the browser after login", style("│").cyan().dim());
+        println!("  {}  Type 'r' and Enter to retry if login failed\n", style("└").cyan().dim());
+
+        client.goto(login_url).await.context("Failed to navigate to login page")?;
+        wait_for_dom_ready(client, Duration::from_millis(settle_ms)).await;
+
+        print!("  {} ", style("└").cyan().dim());
+        std::io::stdout().flush().ok();
+        
+        let mut stdin = String::new();
+        std::io::stdin().read_line(&mut stdin).ok();
+
+        let input = stdin.trim().to_lowercase();
+        if input == "r" || input == "retry" {
+            println!("  {} Retrying login...\n", style("↻").yellow());
+            continue;
+        }
+
+        println!("  {} Capturing login session...", style("→").cyan());
+
+        let final_url: url::Url = client.current_url().await?;
+        final_url_str = final_url.as_str().to_string();
+        let body = client.source().await?;
+        let body_text: String = match client.execute("return document.body.innerText", vec![]).await {
+            Ok(v) => v.as_str().map(|s| s.to_string()).unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+
+        let still_on_login = body.contains("login")
+            && body.contains("password")
+            && (body.contains("username") || body.contains("email"));
+
+        let indicates_error = body_text.contains("forbidden")
+            || body_text.contains("unauthorized")
+            || body_text.contains("invalid credentials")
+            || body_text.contains("incorrect password")
+            || body_text.contains("wrong password")
+            || body_text.contains("login failed")
+            || body_text.contains("authentication failed")
+            || body_text.contains("incorrect")
+            || body_text.contains("try again");
+
+        current_login_success = !still_on_login && !indicates_error;
+        
+        if still_on_login || indicates_error {
+            println!("  {} Login may have failed", style("⚠").yellow());
+            if attempt < 3 {
+                print!("  {} Type 'r' to retry or Enter to continue anyway: ", style("│").cyan().dim());
+                std::io::stdout().flush().ok();
+                let mut retry_input = String::new();
+                std::io::stdin().read_line(&mut retry_input).ok();
+                if retry_input.trim().to_lowercase() == "r" {
+                    continue;
+                }
+                // User chose to continue without retry
+                break;
+            }
+        }
+
+        captured_auth = capture_auth_from_page(client).await?;
+        
+        if current_login_success {
+            println!();
+            println!("  {} Captured:", style("✓").green().bold());
+            if let Some(ref u) = captured_auth.username {
+                println!("  {}   Username: {}", style("│").green(), u);
+            }
+            if let Some(ref sel) = captured_auth.username_selector {
+                println!("  {}   Username field: {}", style("│").green(), sel);
+            }
+            if captured_auth.password.is_some() {
+                println!("  {}   Password field: captured", style("│").green());
+            }
+            if let Some(ref sel) = captured_auth.password_selector {
+                println!("  {}   Password field: {}", style("│").green(), sel);
+            }
+            if let Some(ref sel) = captured_auth.submit_selector {
+                println!("  {}   Submit button: {}", style("│").green(), sel);
+            }
+            break;
+        } else if attempt >= 3 {
+            println!("  {} Continuing without successful login", style("⚠").yellow());
+            break;
+        }
+    }
+
+    let login_discovered_links = if final_url_str != login_url_str && !final_url_str.is_empty() {
+        discover_links_from_page(client, None).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let login_issues = Vec::new();
+
+    Ok((login_issues, login_discovered_links, captured_auth))
+}
+
+/// Capture authentication details from the page after manual login.
+async fn capture_auth_from_page(client: &Client) -> Result<AuthConfig> {
+    let js = r#"
+(function() {
+    var result = {
+        username: null,
+        password: null,
+        username_selector: null,
+        password_selector: null,
+        submit_selector: null
+    };
+    
+    // Get selector for an element with priority: id > name > data-testid > first class
+    function getSelector(el) {
+        if (!el) return null;
+        if (el.id && el.id.trim()) {
+            return '#' + el.id.replace(/:/g, '\\:').replace(/\./g, '\\.');
+        }
+        if (el.name && el.name.trim()) {
+            return '[name="' + el.name.replace(/"/g, '\\"') + '"]';
+        }
+        var testId = el.getAttribute('data-testid') || el.getAttribute('data-test');
+        if (testId) {
+            return '[data-testid="' + testId + '"]';
+        }
+        if (el.getAttribute('aria-label')) {
+            return '[aria-label="' + el.getAttribute('aria-label').replace(/"/g, '\\"') + '"]';
+        }
+        if (el.className && typeof el.className === 'string' && el.className.trim()) {
+            var classes = el.className.trim().split(/\s+/);
+            for (var i = 0; i < classes.length; i++) {
+                if (!classes[i].match(/^(active|disabled|focus|hover|error|success)/i)) {
+                    return '.' + classes[i].replace(/:/g, '\\:').replace(/\./g, '\\.');
+                }
+            }
+            return '.' + classes[0].replace(/:/g, '\\:').replace(/\./g, '\\.');
+        }
+        return null;
+    }
+    
+    // Find username field - try to find any text input with value or autocomplete
+    var textInputs = document.querySelectorAll('input[type="text"], input[type="email"], input[type="tel"], input:not([type])');
+    for (var i = 0; i < textInputs.length; i++) {
+        var el = textInputs[i];
+        if (el.value && el.value.trim().length > 0 && el.type !== 'hidden') {
+            result.username = el.value;
+            result.username_selector = getSelector(el);
+            break;
+        }
+        // Also check by autocomplete attribute
+        var autocomplete = el.getAttribute('autocomplete') || '';
+        if (autocomplete.match(/username|email|user/)) {
+            result.username_selector = getSelector(el);
+            if (el.value) result.username = el.value;
+            break;
+        }
+    }
+    
+    // Fallback: look for any visible input with value that looks like email/username
+    if (!result.username) {
+        var allInputs = document.querySelectorAll('input');
+        for (var i = 0; i < allInputs.length; i++) {
+            var el = allInputs[i];
+            if (el.value && el.value.trim().length > 0 && el.type !== 'hidden' && el.type !== 'password') {
+                var type = el.type || 'text';
+                if (!type.match(/checkbox|radio|submit|image|file|range/)) {
+                    result.username = el.value;
+                    result.username_selector = getSelector(el);
+                    break;
+                }
+            }
+        }
+    }
+    
+    // Find password field
+    var passwords = document.querySelectorAll('input[type="password"]');
+    for (var i = 0; i < passwords.length; i++) {
+        var el = passwords[i];
+        if (el.value && el.value.length > 0) {
+            result.password = '***CAPTURED***';
+            result.password_selector = getSelector(el);
+            break;
+        }
+    }
+    // Also capture password selector even if empty (for future auto-fill)
+    if (!result.password_selector && passwords.length > 0) {
+        result.password_selector = getSelector(passwords[0]);
+    }
+    
+    // Find submit button - look for buttons with login-related text
+    var buttonSelectors = [
+        'button[type="submit"]',
+        'input[type="submit"]',
+        'button',
+        'a[role="button"]',
+        'input[type="button"]'
+    ];
+    
+    for (var b = 0; b < buttonSelectors.length; b++) {
+        var buttons = document.querySelectorAll(buttonSelectors[b]);
+        for (var i = 0; i < buttons.length; i++) {
+            var el = buttons[i];
+            var text = (el.textContent || el.value || el.innerText || '').toLowerCase().trim();
+            var ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+            var combined = text + ' ' + ariaLabel;
+            
+            if (combined.match(/login|sign.?in|submit|continue|next|enter|log.?in|authenticate/)) {
+                result.submit_selector = getSelector(el);
+                break;
+            }
+        }
+        if (result.submit_selector) break;
+    }
+    
+    return result;
+})()
+"#;
+    
+    let captured = client.execute(js, vec![]).await
+        .context("Failed to capture auth details")?;
+    
+    let obj = captured.as_object().ok_or_else(|| anyhow::anyhow!("Invalid capture result"))?;
+    
+    let get_str = |key: &str| -> Option<String> {
+        obj.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+    };
+    
+    let get_opt_str = |key: &str| -> Option<String> {
+        obj.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    Ok(AuthConfig {
+        login_url: None,
+        username: get_str("username"),
+        password: get_str("password"),
+        username_selector: get_opt_str("username_selector"),
+        password_selector: get_opt_str("password_selector"),
+        submit_selector: get_opt_str("submit_selector"),
+        cookies_file: None,
+    })
+}
+
+/// Discover links from the current page (used after login).
+async fn discover_links_from_page(
+    client: &Client,
+    link_selector: Option<&str>,
+) -> Result<Vec<String>> {
+    let js = link_selector.map(|sel| {
+        format!(
+            r#"
+(function() {{
+    var container = document.querySelector('{}');
+    if (!container) return [];
+    var links = container.querySelectorAll('a[href]');
+    return Array.from(links).map(a => a.href).filter(h => h);
+}}
+)"#,
+            sel
+        )
+    });
+
+    let script = js.unwrap_or_else(|| r#"
+(function() {
+    var links = document.querySelectorAll('a[href]');
+    return Array.from(links).map(a => a.href).filter(h => h && !h.startsWith('javascript') && !h.startsWith('mailto'));
+})()"#.to_string());
+
+    let result = client.execute(&script, vec![]).await
+        .context("Failed to discover links")?;
+    
+    let urls: Vec<String> = result
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    
+    Ok(urls)
 }
 
 /// Perform form login using native WebDriver commands (find → send_keys → click).
@@ -1677,8 +2066,8 @@ async fn perform_login(
         }
     }
 
-    tokio::time::sleep(Duration::from_millis(settle_ms.max(500))).await;
-    wait_for_dom_ready(client, Duration::from_secs(8)).await;
+    tokio::time::sleep(Duration::from_millis(settle_ms.max(300))).await;
+    wait_for_dom_ready(client, Duration::from_secs(5)).await;
 
     // Additionally check if the page body indicates a generic auth failure
     let body_text = client

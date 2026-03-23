@@ -24,28 +24,14 @@ use types::{AuthConfig, Issue, IssueCategory, Report, Severity, deduplicate_issu
 ///   webprobe crawl localhost:3000 --depth 10 --users 20 --no-load
 ///
 /// AUTHENTICATION
-///   Prompt for credentials interactively (safest — nothing in shell history):
-///     webprobe crawl 3000 --auth-url /login
+///   When login is required, a browser window opens for you to log in manually.
+///   Your credentials and selectors are auto-captured and saved as a profile.
 ///
-///   Or export as env vars:
-///     export WEBPROBE_USERNAME=admin@example.com
-///     export WEBPROBE_PASSWORD=secret
-///     webprobe crawl 3000 --auth-url /login
-///
-///   Or pass inline (use single-quotes around passwords with special characters):
-///     webprobe crawl 3000 --auth-url /login \
-///       --auth-username admin@example.com --auth-password 'My!Pass'
-///
-///   CSS selectors are auto-detected for most apps. Override if needed:
-///     --auth-username-selector "#email"
-///     --auth-password-selector "#password"
-///     --auth-submit-selector   "button[type='submit']"
-///
-///   Or inject cookies exported from browser DevTools:
-///     webprobe crawl 3000 --cookies cookies.json
+///   Use a saved profile:
+///     webprobe crawl 3000 --profile myapp
 ///
 /// SAVED PROFILES
-///   Save credentials once and reuse across runs:
+///   Reuse credentials across runs:
 ///     webprobe profile add
 ///     webprobe crawl 3000     ← prompted to load a profile
 #[derive(Parser)]
@@ -60,18 +46,8 @@ enum Commands {
     /// Crawl every route, audit for issues, then run a load test
     ///
     /// AUTHENTICATION
-    ///   Auto-fills login forms using native browser input events (React-compatible).
-    ///   CSS selectors are auto-detected for most apps. Override only if needed.
-    ///
-    ///   Interactive (safest — nothing stored in shell history):
-    ///     webprobe crawl 3000 --auth-url /login
-    ///
-    ///   Inline flags:
-    ///     webprobe crawl 3000 --auth-url /login \
-    ///       --auth-username you@example.com --auth-password 'My!Pass'
-    ///
-    ///   Inject cookies from browser DevTools (Application → Cookies):
-    ///     webprobe crawl 3000 --cookies cookies.json
+    ///   When login is required, a browser window opens for you to log in manually.
+    ///   Your credentials and form selectors are automatically captured and saved as a profile.
     ///
     ///   Use a saved profile:
     ///     webprobe crawl 3000 --profile myapp
@@ -103,8 +79,8 @@ enum Commands {
         #[arg(long)]
         headed: bool,
 
-        /// Milliseconds to wait for JS to settle after DOM ready
-        #[arg(long, default_value_t = 300)]
+        /// Milliseconds to wait for JS to settle after DOM ready (default: 200ms)
+        #[arg(long, default_value_t = 200)]
         wait_ms: u64,
 
         /// Skip the load test phase
@@ -121,46 +97,6 @@ enum Commands {
         #[arg(long)]
         separate_reports: bool,
 
-        // ── Auth ──────────────────────────────────────────────────────────────
-        /// Login page path or URL — triggers form-based auth before crawling
-        /// (e.g. /login or http://localhost:3000/login)
-        #[arg(long, value_name = "URL")]
-        auth_url: Option<String>,
-
-        /// Username or email to fill into the login form.
-        /// Falls back to WEBPROBE_USERNAME env var, then prompts interactively.
-        /// Tip: omit this flag to avoid shell quoting / history issues.
-        #[arg(long, value_name = "USERNAME")]
-        auth_username: Option<String>,
-
-        /// Password to fill into the login form.
-        /// Falls back to WEBPROBE_PASSWORD env var, then prompts interactively (hidden input).
-        /// Tip: omit this flag to avoid shell quoting / history issues.
-        #[arg(long, value_name = "PASSWORD")]
-        auth_password: Option<String>,
-
-        /// CSS selector for the username/email input.
-        /// Optional — auto-detected from input type, name, id, placeholder and aria-label.
-        /// Provide only if auto-detection picks the wrong field.
-        #[arg(long, value_name = "SELECTOR")]
-        auth_username_selector: Option<String>,
-
-        /// CSS selector for the password input.
-        /// Optional — auto-detected from input type='password'.
-        /// Provide only if auto-detection picks the wrong field.
-        #[arg(long, value_name = "SELECTOR")]
-        auth_password_selector: Option<String>,
-
-        /// CSS selector for the submit / sign-in button.
-        /// Optional — auto-detected from button type, text, or aria-label.
-        /// Provide only if auto-detection clicks the wrong element.
-        #[arg(long, value_name = "SELECTOR")]
-        auth_submit_selector: Option<String>,
-
-        /// Path to a JSON cookie file to inject instead of form login.
-        /// Export from browser DevTools → Application → Cookies → right-click → Copy as JSON.
-        #[arg(long, value_name = "FILE")]
-        cookies: Option<PathBuf>,
 
         /// Disable penetration testing checks (enabled by default).
         /// Run comprehensive security audit: security headers, cookie security, CORS,
@@ -293,6 +229,35 @@ fn parse_skip_paths(input: &str) -> Vec<String> {
         .collect()
 }
 
+fn save_profile(name: &str, login_url: Option<String>, captured: &types::AuthConfig) {
+    let new_profile = AuthProfile {
+        name: name.to_string(),
+        login_url,
+        username: captured.username.clone(),
+        password: captured.password.clone(),
+        username_selector: captured.username_selector.clone(),
+        password_selector: captured.password_selector.clone(),
+        submit_selector: captured.submit_selector.clone(),
+    };
+    match ProfileStore::load() {
+        Ok(mut store) => {
+            store.upsert(new_profile);
+            if let Err(e) = store.save() {
+                eprintln!("  {} Could not save profile: {}", style("⚠").yellow(), e);
+            } else {
+                println!(
+                    "  {} Auth profile '{}' saved.",
+                    style("✓").green(),
+                    name
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("  {} Could not load profiles: {}", style("⚠").yellow(), e);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputFormat {
     Json,
@@ -352,13 +317,6 @@ async fn main() -> Result<()> {
             no_load,
             verbose,
             separate_reports,
-            auth_url,
-            auth_username,
-            auth_password,
-            auth_username_selector,
-            auth_password_selector,
-            auth_submit_selector,
-            cookies,
             no_pentest,
             skip,
             selector,
@@ -412,16 +370,12 @@ async fn main() -> Result<()> {
             };
 
             // ── Authentication ────────────────────────────────────────────────
-            let mut auth_url = auth_url;
-            let mut auth_username = auth_username;
-            let mut auth_password = auth_password;
-            let mut auth_username_selector = auth_username_selector;
-            let mut auth_password_selector = auth_password_selector;
-            let mut auth_submit_selector = auth_submit_selector;
-            // Tracks whether auth was loaded from a saved profile (skip the save prompt)
-            // and the name of that profile so we can save missing fields back to it.
-            let mut profile_used = false;
-            let mut loaded_profile_name: Option<String> = None;
+            let mut auth_url: Option<String> = None;
+            let mut auth_username: Option<String> = None;
+            let mut auth_password: Option<String> = None;
+            let mut auth_username_selector: Option<String> = None;
+            let mut auth_password_selector: Option<String> = None;
+            let mut auth_submit_selector: Option<String> = None;
 
             // Apply --profile defaults (explicit flags take precedence)
             if let Some(profile_name) = &profile {
@@ -445,8 +399,6 @@ async fn main() -> Result<()> {
                     if auth_submit_selector.is_none() {
                         auth_submit_selector = p.submit_selector.clone();
                     }
-                    profile_used = true;
-                    loaded_profile_name = Some(p.name.clone());
                     println!(
                         "  {}  Using profile: {}",
                         style("→").cyan(),
@@ -461,17 +413,8 @@ async fn main() -> Result<()> {
                 }
             }
 
-            let mut auth_username =
-                auth_username.or_else(|| std::env::var("WEBPROBE_USERNAME").ok());
-            let mut auth_password =
-                auth_password.or_else(|| std::env::var("WEBPROBE_PASSWORD").ok());
-
-            // Only ask about auth if nothing was provided via flags/env.
-            if auth_url.is_none()
-                && auth_username.is_none()
-                && auth_password.is_none()
-                && cookies.is_none()
-            {
+            // Only ask about auth if no profile is loaded.
+            if auth_url.is_none() {
                 println!();
                 println!(
                     "  {}  {}",
@@ -522,8 +465,6 @@ async fn main() -> Result<()> {
                                 auth_password_selector.or_else(|| p.password_selector.clone());
                             auth_submit_selector =
                                 auth_submit_selector.or_else(|| p.submit_selector.clone());
-                            profile_used = true;
-                            loaded_profile_name = Some(p.name.clone());
                             println!(
                                 "  {}  Loaded profile: {}",
                                 style("✓").green(),
@@ -546,6 +487,7 @@ async fn main() -> Result<()> {
                     io::stdin().read_line(&mut input).ok();
 
                     if input.trim().eq_ignore_ascii_case("y") {
+                        // Get login URL from user
                         println!();
                         println!(
                             "  {}  {}",
@@ -571,344 +513,20 @@ async fn main() -> Result<()> {
                             eprintln!("  {}  Login URL is required.", style("⚠").yellow());
                         }
 
-                        // Username (required)
-                        if auth_username.is_none() {
-                            loop {
-                                print!(
-                                    "  {}  {} ",
-                                    style("├").cyan().dim(),
-                                    style("Username / email:").dim()
-                                );
-                                io::stdout().flush().ok();
-                                let mut u_input = String::new();
-                                io::stdin().read_line(&mut u_input).ok();
-                                let trimmed = u_input.trim().to_string();
-                                if !trimmed.is_empty() {
-                                    auth_username = Some(trimmed);
-                                    break;
-                                }
-                                eprintln!("  {}  Username is required.", style("⚠").yellow());
-                            }
-                        }
-
-                        // Password (required)
-                        if auth_password.is_none() {
-                            loop {
-                                let pwd = rpassword::prompt_password(format!(
-                                    "  {}  {} ",
-                                    style("├").cyan().dim(),
-                                    style("Password:").dim()
-                                ))
-                                .unwrap_or_default();
-                                if !pwd.is_empty() {
-                                    auth_password = Some(pwd);
-                                    break;
-                                }
-                                eprintln!("  {}  Password is required.", style("⚠").yellow());
-                            }
-                        }
-
-                        // CSS selector prompts (required when auth is enabled)
-                        println!();
-                        println!(
-                            "  {}  {}",
-                            style("◆").cyan().bold(),
-                            style("Form selectors").bold()
-                        );
-                        println!(
-                            "  {}  {}",
-                            style("│").cyan().dim(),
-                            style("How to find a selector:  open DevTools (F12) → right-click")
-                                .dim()
-                        );
-                        println!(
-                            "  {}  {}",
-                            style("│").cyan().dim(),
-                            style("the element → Inspect → right-click the node in the HTML").dim()
-                        );
-                        println!(
-                            "  {}  {}",
-                            style("│").cyan().dim(),
-                            style("panel → Copy → Copy selector.").dim()
-                        );
-                        println!();
-
-                        if auth_username_selector.is_none() {
-                            print!(
-                                "  {}  {} ",
-                                style("├").cyan().dim(),
-                                style("Username field selector (optional, Enter to auto-detect):")
-                                    .dim()
-                            );
-                            io::stdout().flush().ok();
-                            let mut s = String::new();
-                            io::stdin().read_line(&mut s).ok();
-                            let trimmed = s.trim().to_string();
-                            if !trimmed.is_empty() {
-                                auth_username_selector = Some(trimmed);
-                            }
-                        }
-
-                        if auth_password_selector.is_none() {
-                            print!(
-                                "  {}  {} ",
-                                style("├").cyan().dim(),
-                                style("Password field selector (optional, Enter to auto-detect):")
-                                    .dim()
-                            );
-                            io::stdout().flush().ok();
-                            let mut s = String::new();
-                            io::stdin().read_line(&mut s).ok();
-                            let trimmed = s.trim().to_string();
-                            if !trimmed.is_empty() {
-                                auth_password_selector = Some(trimmed);
-                            }
-                        }
-
-                        if auth_submit_selector.is_none() {
-                            print!(
-                                "  {}  {} ",
-                                style("└").cyan().dim(),
-                                style("Submit button selector (optional, Enter to auto-detect):")
-                                    .dim()
-                            );
-                            io::stdout().flush().ok();
-                            let mut s = String::new();
-                            io::stdin().read_line(&mut s).ok();
-                            let trimmed = s.trim().to_string();
-                            if !trimmed.is_empty() {
-                                auth_submit_selector = Some(trimmed);
-                            }
-                        }
+                        // For manual login, we'll use empty credentials so perform_login
+                        // doesn't auto-fill anything, allowing the user to type manually
+                        auth_username = None;
+                        auth_password = None;
+                        auth_username_selector = None;
+                        auth_password_selector = None;
+                        auth_submit_selector = None;
                     }
                 } // end if !profile_loaded
             }
 
-            // If credentials supplied via flags/env but no login URL, prompt for it.
-            if auth_url.is_none() && (auth_username.is_some() || auth_password.is_some()) {
-                loop {
-                    print!(
-                        "  {}  {} ",
-                        style("└").cyan().dim(),
-                        style("Login page path or URL (e.g. /login):").dim()
-                    );
-                    io::stdout().flush().ok();
-                    let mut input = String::new();
-                    io::stdin().read_line(&mut input).ok();
-                    let trimmed = input.trim().to_string();
-                    if !trimmed.is_empty() {
-                        auth_url = Some(trimmed);
-                        break;
-                    }
-                    eprintln!("  {}  Login URL is required.", style("⚠").yellow());
-                }
-            }
-
-            // If --auth-url is set but credentials are still missing (not prompted above), ask now.
-            if auth_url.is_some() {
-                if auth_username.is_none() {
-                    loop {
-                        print!(
-                            "  {}  {} ",
-                            style("├").cyan().dim(),
-                            style("Username:").dim()
-                        );
-                        io::stdout().flush().ok();
-                        let mut input = String::new();
-                        io::stdin().read_line(&mut input).ok();
-                        let trimmed = input.trim().to_string();
-                        if !trimmed.is_empty() {
-                            auth_username = Some(trimmed);
-                            break;
-                        }
-                        eprintln!("  {}  Username is required.", style("⚠").yellow());
-                    }
-                }
-                if auth_password.is_none() {
-                    loop {
-                        let pwd = rpassword::prompt_password(format!(
-                            "  {}  {} ",
-                            style("└").cyan().dim(),
-                            style("Password:").dim()
-                        ))
-                        .unwrap_or_default();
-                        if !pwd.is_empty() {
-                            auth_password = Some(pwd);
-                            break;
-                        }
-                        eprintln!("  {}  Password is required.", style("⚠").yellow());
-                    }
-                }
-                // Require selectors when auth is enabled via flags/env
-                let need_selectors = auth_username_selector.is_none()
-                    || auth_password_selector.is_none()
-                    || auth_submit_selector.is_none();
-                if need_selectors {
-                    println!();
-                    println!(
-                        "  {}  {}",
-                        style("◆").cyan().bold(),
-                        style("Form selectors").bold()
-                    );
-                    println!(
-                        "  {}  {}",
-                        style("│").cyan().dim(),
-                        style("How to find a selector:  open DevTools (F12) → right-click").dim()
-                    );
-                    println!(
-                        "  {}  {}",
-                        style("│").cyan().dim(),
-                        style("the element → Inspect → right-click the node in the HTML").dim()
-                    );
-                    println!(
-                        "  {}  {}",
-                        style("│").cyan().dim(),
-                        style("panel → Copy → Copy selector.").dim()
-                    );
-                    println!();
-                }
-                if auth_username_selector.is_none() {
-                    print!(
-                        "  {}  {} ",
-                        style("├").cyan().dim(),
-                        style("Username field selector (optional, Enter to auto-detect):").dim()
-                    );
-                    io::stdout().flush().ok();
-                    let mut s = String::new();
-                    io::stdin().read_line(&mut s).ok();
-                    let trimmed = s.trim().to_string();
-                    if !trimmed.is_empty() {
-                        auth_username_selector = Some(trimmed);
-                    }
-                }
-                if auth_password_selector.is_none() {
-                    print!(
-                        "  {}  {} ",
-                        style("├").cyan().dim(),
-                        style("Password field selector (optional, Enter to auto-detect):").dim()
-                    );
-                    io::stdout().flush().ok();
-                    let mut s = String::new();
-                    io::stdin().read_line(&mut s).ok();
-                    let trimmed = s.trim().to_string();
-                    if !trimmed.is_empty() {
-                        auth_password_selector = Some(trimmed);
-                    }
-                }
-                if auth_submit_selector.is_none() {
-                    print!(
-                        "  {}  {} ",
-                        style("└").cyan().dim(),
-                        style("Submit button selector (optional, Enter to auto-detect):").dim()
-                    );
-                    io::stdout().flush().ok();
-                    let mut s = String::new();
-                    io::stdin().read_line(&mut s).ok();
-                    let trimmed = s.trim().to_string();
-                    if !trimmed.is_empty() {
-                        auth_submit_selector = Some(trimmed);
-                    }
-                }
-            }
-
-            // If a profile was used but it was missing fields that we just collected,
-            // save those new fields back to the profile automatically.
-            if let Some(ref pname) = loaded_profile_name {
-                if let Ok(mut store) = ProfileStore::load() {
-                    if let Some(existing) = store.get(pname).cloned() {
-                        let orig_login_url = existing.login_url.clone();
-                        let orig_user_sel = existing.username_selector.clone();
-                        let orig_pass_sel = existing.password_selector.clone();
-                        let orig_sub_sel = existing.submit_selector.clone();
-                        let updated = AuthProfile {
-                            name: existing.name.clone(),
-                            login_url: auth_url.clone().or(existing.login_url),
-                            username: auth_username.clone().or(existing.username),
-                            password: auth_password.clone().or(existing.password),
-                            username_selector: auth_username_selector
-                                .clone()
-                                .or(existing.username_selector),
-                            password_selector: auth_password_selector
-                                .clone()
-                                .or(existing.password_selector),
-                            submit_selector: auth_submit_selector
-                                .clone()
-                                .or(existing.submit_selector),
-                        };
-                        let changed = updated.login_url != orig_login_url
-                            || updated.username_selector != orig_user_sel
-                            || updated.password_selector != orig_pass_sel
-                            || updated.submit_selector != orig_sub_sel;
-                        if changed {
-                            store.upsert(updated);
-                            if store.save().is_ok() {
-                                println!(
-                                    "  {}  Profile {:?} updated with new fields.",
-                                    style("✓").green(),
-                                    pname
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Offer to save auth details as a profile
-            if !profile_used && auth_url.is_some() {
-                println!();
-                print!(
-                    "  {}  {} ",
-                    style("◆").cyan().dim(),
-                    style("Save these auth details as a profile? [y/N]:").dim()
-                );
-                io::stdout().flush().ok();
-                let mut save_input = String::new();
-                io::stdin().read_line(&mut save_input).ok();
-                if save_input.trim().eq_ignore_ascii_case("y") {
-                    print!(
-                        "  {}  {} ",
-                        style("└").cyan().dim(),
-                        style("Profile name:").dim()
-                    );
-                    io::stdout().flush().ok();
-                    let mut name_input = String::new();
-                    io::stdin().read_line(&mut name_input).ok();
-                    let name = name_input.trim().to_string();
-                    if !name.is_empty() {
-                        let new_profile = AuthProfile {
-                            name: name.clone(),
-                            login_url: auth_url.clone(),
-                            username: auth_username.clone(),
-                            password: auth_password.clone(),
-                            username_selector: auth_username_selector.clone(),
-                            password_selector: auth_password_selector.clone(),
-                            submit_selector: auth_submit_selector.clone(),
-                        };
-                        match ProfileStore::load() {
-                            Ok(mut store) => {
-                                store.upsert(new_profile);
-                                match store.save() {
-                                    Ok(()) => println!(
-                                        "  {}  Profile {:?} saved.",
-                                        style("✓").green(),
-                                        name
-                                    ),
-                                    Err(e) => eprintln!(
-                                        "  {}  Could not save profile: {}",
-                                        style("⚠").yellow(),
-                                        e
-                                    ),
-                                }
-                            }
-                            Err(e) => eprintln!(
-                                "  {}  Could not load profiles: {}",
-                                style("⚠").yellow(),
-                                e
-                            ),
-                        }
-                    }
-                }
-            }
+            // For manual login, force headed mode so user can interact with the browser
+            let manual_login = auth_url.is_some() && auth_username.is_none() && auth_password.is_none();
+            let is_headed = headed || manual_login;
 
             // ── Summary line before crawling ──────────────────────────────────
             println!();
@@ -929,6 +547,8 @@ async fn main() -> Result<()> {
                 style(&url).underlined()
             );
 
+            let auth_login_url = auth_url.clone();
+
             let auth = AuthConfig {
                 login_url: auth_url,
                 username: auth_username,
@@ -936,14 +556,14 @@ async fn main() -> Result<()> {
                 username_selector: auth_username_selector,
                 password_selector: auth_password_selector,
                 submit_selector: auth_submit_selector,
-                cookies_file: cookies,
+                cookies_file: None,
             };
 
             let crawler_config = crawler::CrawlerConfig {
                 start_url: url.clone(),
                 max_depth: depth,
                 concurrency,
-                headless: !headed,
+                headless: !is_headed,
                 settle_ms: wait_ms,
                 auth,
                 skip_paths,
@@ -952,6 +572,47 @@ async fn main() -> Result<()> {
             };
 
             let crawl_result = crawler::run_crawler(crawler_config).await?;
+
+            // Auto-save captured auth as profile after successful manual login
+            if let Some(ref captured) = crawl_result.captured_auth {
+                if captured.username.is_some() || captured.password.is_some() || captured.username_selector.is_some() {
+                    println!();
+                    print!(
+                        "  {}  {} ",
+                        style("◆").cyan().dim(),
+                        style("Save as profile? Enter name (or press Enter for 'default'):").dim()
+                    );
+                    io::stdout().flush().ok();
+                    let mut name_input = String::new();
+                    io::stdin().read_line(&mut name_input).ok();
+                    let profile_name = name_input.trim().to_string();
+                    
+                    let final_name = if profile_name.is_empty() { "default".to_string() } else { profile_name.clone() };
+                    
+                    // Check if profile already exists and ask to overwrite
+                    if let Ok(store) = ProfileStore::load() {
+                        if store.get(&final_name).is_some() && !profile_name.is_empty() {
+                            print!(
+                                "  {}  Profile '{}' exists. Overwrite? [y/N]: ",
+                                style("│").cyan().dim(),
+                                final_name
+                            );
+                            io::stdout().flush().ok();
+                            let mut confirm = String::new();
+                            io::stdin().read_line(&mut confirm).ok();
+                            if !confirm.trim().eq_ignore_ascii_case("y") {
+                                println!("  {} Profile not saved.", style("→").cyan());
+                            } else {
+                                save_profile(&final_name, auth_login_url.clone(), captured);
+                            }
+                        } else {
+                            save_profile(&final_name, auth_login_url.clone(), captured);
+                        }
+                    } else {
+                        save_profile(&final_name, auth_login_url.clone(), captured);
+                    }
+                }
+            }
 
             let mut report = Report::new(&url);
             report.issues = crawl_result.issues;

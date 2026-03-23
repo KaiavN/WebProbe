@@ -218,6 +218,7 @@ pub struct LoadTestResult {
 /// Per-page network timing collected via the browser's Performance API.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NetworkStats {
+    #[allow(dead_code)]
     #[serde(skip)]
     pub page_url: String,
     /// DNS lookup time for the main document (ms) — always 0 on localhost
@@ -273,6 +274,7 @@ pub struct InteractiveElement {
 /// All interactive elements found on a single page.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PageInteractions {
+    #[allow(dead_code)]
     #[serde(skip)]
     pub page_url: String,
     /// Total interactive elements found
@@ -437,10 +439,22 @@ mod tests {
         );
 
         // Also test root URL normalization
-        assert_eq!(PageState::new("http://example.com").fingerprint(), "http://example.com");
-        assert_eq!(PageState::new("http://example.com/").fingerprint(), "http://example.com");
-        assert_eq!(PageState::new("http://example.com/path").fingerprint(), "http://example.com/path");
-        assert_eq!(PageState::new("http://example.com/path/").fingerprint(), "http://example.com/path");
+        assert_eq!(
+            PageState::new("http://example.com").fingerprint(),
+            "http://example.com"
+        );
+        assert_eq!(
+            PageState::new("http://example.com/").fingerprint(),
+            "http://example.com"
+        );
+        assert_eq!(
+            PageState::new("http://example.com/path").fingerprint(),
+            "http://example.com/path"
+        );
+        assert_eq!(
+            PageState::new("http://example.com/path/").fingerprint(),
+            "http://example.com/path"
+        );
     }
 
     #[test]
@@ -506,7 +520,10 @@ mod tests {
             .find(|i| matches!(i.severity, Severity::Warning))
             .unwrap();
         assert_eq!(warning_issue.message, "Slow resource");
-        assert_eq!(warning_issue.page_urls, vec!["http://localhost/".to_string()]);
+        assert_eq!(
+            warning_issue.page_urls,
+            vec!["http://localhost/".to_string()]
+        );
         assert!(warning_issue.action_path.is_empty());
     }
 
